@@ -10,9 +10,12 @@ import {
 test("default ACP runner registry is the single source for all built-in runtimes", () => {
   assert.deepEqual(
     defaultAcpRunnerRegistry.list().map((registration) => registration.kind),
-    ["claude-code", "codex", "codebuddy"],
+    ["claude-code", "codex", "codebuddy", "dsh"],
   );
   assert.equal(defaultAcpRunnerRegistry.runtimeMap().get("codex")?.kind, "codex");
+  assert.equal(defaultAcpRunnerRegistry.runtimeMap().get("dsh")?.kind, "dsh");
+  assert.equal(defaultAcpRunnerRegistry.get("dsh")?.availabilityKey, "dsh");
+  assert.equal(defaultAcpRunnerRegistry.get("dsh")?.resolveProbeCommand(), "dsh");
 });
 
 test("ACP runner registry rejects mismatched and duplicate registrations", () => {

@@ -709,7 +709,7 @@ runAttachmentDraftCleanup();
 function parseSupervisorConfig(input: { runtime?: unknown; model?: unknown }):
   { config: SupervisorConfig } | { error: string } {
   if (!isAgentRuntimeKind(input.runtime)) {
-    return { error: "监工运行时必须是 claude-code、codex 或 codebuddy。" };
+    return { error: "监工运行时必须是 claude-code、codex、codebuddy 或 dsh。" };
   }
   const runtime = input.runtime;
   if (input.model === undefined || input.model === null) return { config: { runtime } };

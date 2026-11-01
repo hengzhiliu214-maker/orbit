@@ -14,6 +14,10 @@ import {
   codexRuntime,
   resolveCodexAcpCommand,
 } from "./codex-acp-runtime.ts";
+import {
+  DSH_ACP,
+  dshRuntime,
+} from "./dsh-acp-runtime.ts";
 import type { AcpRuntimeDefinition } from "./acp-runtime.ts";
 
 export type AcpRunnerRegistration = {
@@ -77,6 +81,13 @@ export const defaultAcpRunnerRegistry = new AcpRunnerRegistry([
     definition: CODEBUDDY_ACP,
     runtime: codeBuddyRuntime,
     resolveProbeCommand: () => "codebuddy",
+  },
+  {
+    kind: "dsh",
+    availabilityKey: "dsh",
+    definition: DSH_ACP,
+    runtime: dshRuntime,
+    resolveProbeCommand: () => "dsh",
   },
 ]);
 

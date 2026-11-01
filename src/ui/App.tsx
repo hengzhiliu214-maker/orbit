@@ -4376,6 +4376,9 @@ function RuntimeBadge({ runtime }: { runtime: AgentState["runtime"] }) {
 }
 
 function runtimeLabel(runtime: AgentState["runtime"]): string {
+  if (runtime === "dsh") {
+    return "DeepSeek Harness";
+  }
   if (runtime === "codebuddy") {
     return "CodeBuddy";
   }

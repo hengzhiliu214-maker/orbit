@@ -97,5 +97,5 @@ function isAgentModelStateSnapshot(storageKey: string, value: unknown): value is
 }
 
 function isAgentRuntimeKind(value: unknown): value is AgentModelStateSnapshot["runtimeKind"] {
-  return value === "claude-code" || value === "codex" || value === "codebuddy";
+  return value === "claude-code" || value === "codex" || value === "codebuddy" || value === "dsh";
 }

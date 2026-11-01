@@ -17,13 +17,14 @@ test("probeRuntime returns not available for nonexistent command", async () => {
   assert.ok(result.error, "should have error message");
 });
 
-test("probeAllRuntimes returns results for all three runtimes", async () => {
+test("probeAllRuntimes returns results for all four runtimes", async () => {
   const results = await probeAllRuntimes();
-  assert.equal(results.length, 3);
+  assert.equal(results.length, 4);
   const names = results.map((r) => r.runtime);
   assert.ok(names.includes("claude-agent-acp"));
   assert.ok(names.includes("codex-acp"));
   assert.ok(names.includes("codebuddy"));
+  assert.ok(names.includes("dsh"));
   for (const result of results) {
     assert.equal(typeof result.available, "boolean");
     if (result.available) {
@@ -53,6 +54,10 @@ test("runtimeKindToCliKey maps codex to the Codex ACP adapter", () => {
 
 test("runtimeKindToCliKey passes through codebuddy unchanged", () => {
   assert.equal(runtimeKindToCliKey("codebuddy"), "codebuddy");
+});
+
+test("runtimeKindToCliKey passes through dsh unchanged", () => {
+  assert.equal(runtimeKindToCliKey("dsh"), "dsh");
 });
 
 test("runtimeKindToCliKey handles unknown runtime types gracefully", () => {
@@ -96,6 +101,12 @@ test("runtimeMeta returns label and installUrl for codebuddy", () => {
   assert.equal(meta.label, "CodeBuddy");
   assert.ok(meta.installUrl.includes("codebuddy"), "should have codebuddy install URL");
   assert.ok(meta.installCommand.includes("@tencent-ai/codebuddy-code"), "should include CodeBuddy install command");
+});
+
+test("runtimeMeta returns label and installUrl for dsh", () => {
+  const meta = runtimeMeta("dsh");
+  assert.equal(meta.label, "DeepSeek Harness");
+  assert.ok(meta.installUrl.includes("deepseek"), "should have DeepSeek Harness URL");
 });
 
 test("runtimeMeta returns runtime name as label for unknown runtime", () => {
