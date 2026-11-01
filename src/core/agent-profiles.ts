@@ -22,6 +22,9 @@ export function createSupervisorProfile(cwd: string, config: SupervisorConfig): 
     ...(config.model?.runtimeKind === config.runtime && config.model.preferredModelId?.trim()
       ? { preferredModelId: config.model.preferredModelId.trim() }
       : {}),
+    ...(config.model?.runtimeKind === config.runtime && config.model.preferredReasoningValue?.trim()
+      ? { preferredReasoningValue: config.model.preferredReasoningValue.trim() }
+      : {}),
   };
 }
 
@@ -60,6 +63,9 @@ export function configsToProfiles(configs: readonly AgentConfig[], cwd: string):
     // 时所处的 runtime 与当前 runtime 不一致即不应用。
     ...(config.model?.runtimeKind === config.runtime && config.model.preferredModelId?.trim()
       ? { preferredModelId: config.model.preferredModelId.trim() }
+      : {}),
+    ...(config.model?.runtimeKind === config.runtime && config.model.preferredReasoningValue?.trim()
+      ? { preferredReasoningValue: config.model.preferredReasoningValue.trim() }
       : {}),
   }));
 }

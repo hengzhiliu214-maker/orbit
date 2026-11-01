@@ -118,6 +118,30 @@ test("model preference round-trips through the store", () => {
   }
 });
 
+test("reasoning preference round-trips and validates like the model preference", () => {
+  const dir = tempDir();
+  try {
+    const store = new AgentConfigStore(dir);
+    const configs = [config({ name: "助手", model: { preferredReasoningValue: "high", runtimeKind: "codebuddy" } })];
+    store.save("ws1", configs);
+    assert.deepEqual(store.load("ws1"), configs);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  assert.deepEqual(
+    validateAgentConfigs([config({ name: "助手", model: { preferredReasoningValue: "high", runtimeKind: "codebuddy" } })]),
+    [],
+  );
+  assert.ok(
+    validateAgentConfigs([config({ name: "助手", model: { preferredReasoningValue: "", runtimeKind: "codebuddy" } })])
+      .some((error) => error.includes("model.preferredReasoningValue")),
+  );
+  assert.ok(
+    validateAgentConfigs([config({ name: "助手", model: { preferredReasoningValue: "x".repeat(129), runtimeKind: "dsh" } })])
+      .some((error) => error.includes("at most 128")),
+  );
+});
+
 test("model preference validation rejects malformed entries", () => {
   assert.deepEqual(
     validateAgentConfigs([config({ name: "助手", model: { preferredModelId: "glm-5.2", runtimeKind: "claude-code" } })]),

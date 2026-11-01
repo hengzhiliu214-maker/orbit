@@ -48,6 +48,8 @@ export type AgentRuntimeRunOptions = {
   poolKey?: string;
   /** 员工首选模型 ID（issue #142）：会话建立后、prompt 前尽力应用，失败只提示。 */
   preferredModelId?: string;
+  /** 员工首选思考强度：模型应用后按会话最新 config options 校验并尽力下发，失败只提示、绝不静默替换。 */
+  preferredReasoningValue?: string;
   /** 该员工最近一次的模型快照；池复用连接没有响应可读时用它补发偏好。 */
   lastSessionConfig?: AgentModelStateSnapshot;
   /** 模型快照回调：runtime 返回或切换后携带最新模型列表与当前值。 */

@@ -101,6 +101,13 @@ export function validateAgentConfigs(configs: AgentConfig[]): string[] {
             errors.push(`Agent "${configId}" model.preferredModelId must be at most 128 characters.`);
           }
         }
+        if (model.preferredReasoningValue !== undefined) {
+          if (typeof model.preferredReasoningValue !== "string" || !model.preferredReasoningValue.trim()) {
+            errors.push(`Agent "${configId}" model.preferredReasoningValue must be a non-empty string.`);
+          } else if (model.preferredReasoningValue.length > 128) {
+            errors.push(`Agent "${configId}" model.preferredReasoningValue must be at most 128 characters.`);
+          }
+        }
       }
     }
 

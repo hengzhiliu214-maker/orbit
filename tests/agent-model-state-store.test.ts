@@ -58,6 +58,46 @@ test("updating the same agent replaces its snapshot without touching others", ()
   }
 });
 
+test("snapshots with a reasoning section round-trip through the store", () => {
+  const dir = tempDir();
+  try {
+    const store = new AgentModelStateStore(dir);
+    store.update("ws1", snapshot({
+      runtimeKind: "codebuddy",
+      reasoning: {
+        configId: "thought_level",
+        choices: [
+          { value: "enabled", name: "Enabled" },
+          { value: "high", name: "High" },
+        ],
+        currentValue: "high",
+        currentValueSource: "session",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+    }));
+    const loaded = store.get("ws1", "developer");
+    assert.equal(loaded?.reasoning?.configId, "thought_level");
+    assert.equal(loaded?.reasoning?.currentValue, "high");
+    assert.deepEqual(loaded?.reasoning?.choices.map((choice) => choice.value), ["enabled", "high"]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("snapshots with a malformed reasoning section are dropped", () => {
+  const dir = tempDir();
+  try {
+    const store = new AgentModelStateStore(dir);
+    const malformed = snapshot({
+      reasoning: { configId: 42 } as unknown as AgentModelStateSnapshot["reasoning"],
+    });
+    store.update("ws1", malformed);
+    assert.equal(store.get("ws1", "developer"), undefined);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("missing or malformed files degrade to an empty state", () => {
   const dir = tempDir();
   try {

@@ -319,6 +319,10 @@ export class ConversationContext {
         INTERNAL_SUPERVISOR_ID,
         config.model?.runtimeKind === config.runtime ? config.model?.preferredModelId : undefined,
       );
+      this.agents.updatePreferredReasoning(
+        INTERNAL_SUPERVISOR_ID,
+        config.model?.runtimeKind === config.runtime ? config.model?.preferredReasoningValue : undefined,
+      );
       this._supervisorConfig = config;
     }
     this.options.onConversationPatch?.({ supervisorConfig: config });

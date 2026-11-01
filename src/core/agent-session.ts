@@ -42,6 +42,7 @@ export type AgentSessionOptions = {
   workspaceId?: string;
   interactionTimeoutMs?: number;
   preferredModelId?: string;
+  preferredReasoningValue?: string;
   modelState?: AgentModelStateBridge;
 };
 
@@ -91,11 +92,13 @@ export class AgentSession {
   private runCount = 0;
   /** 首选模型可在会话运行期间更新（issue #153），下一次运行开始时生效。 */
   private preferredModelId?: string;
+  private preferredReasoningValue?: string;
   /** 斜杠命令缓存（issue #160）：只存内存，命令属于活的后端会话，不落盘。 */
   private sessionCommands: SessionCommands | null = null;
 
   constructor(private readonly options: AgentSessionOptions) {
     this.preferredModelId = options.preferredModelId;
+    this.preferredReasoningValue = options.preferredReasoningValue;
   }
 
   /**
@@ -104,6 +107,15 @@ export class AgentSession {
    */
   setPreferredModelId(preferredModelId?: string): void {
     this.preferredModelId = preferredModelId?.trim() || undefined;
+  }
+
+  /** 更新首选思考强度。语义同 setPreferredModelId：只改内存偏好，下一次运行生效。 */
+  setPreferredReasoningValue(preferredReasoningValue?: string): void {
+    this.preferredReasoningValue = preferredReasoningValue?.trim() || undefined;
+  }
+
+  preferredReasoning(): string | undefined {
+    return this.preferredReasoningValue;
   }
 
   preferredModel(): string | undefined {
@@ -297,6 +309,7 @@ export class AgentSession {
       // 模型偏好（issue #142）：每次运行开始时读最近快照并惰性应用。
       // 读可变字段而非 options，使运行期更新的偏好在下一次运行生效（issue #153）。
       preferredModelId: this.preferredModelId,
+      preferredReasoningValue: this.preferredReasoningValue,
       lastSessionConfig: this.options.modelState?.load(this.id),
       onSessionConfig: this.options.modelState
         ? (snapshot) => this.options.modelState!.update(snapshot)

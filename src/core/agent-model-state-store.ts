@@ -93,7 +93,25 @@ function isAgentModelStateSnapshot(storageKey: string, value: unknown): value is
     && typeof (choice as Record<string, unknown>).name === "string"
   ))) return false;
   if (snapshot.currentValueSource !== undefined && snapshot.currentValueSource !== "probe" && snapshot.currentValueSource !== "session") return false;
+  if (snapshot.modelApplyPath !== undefined && snapshot.modelApplyPath !== "config_option" && snapshot.modelApplyPath !== "session_model") return false;
+  if (snapshot.reasoning !== undefined && !isAgentReasoningStateSnapshot(snapshot.reasoning)) return false;
   return snapshot.currentValue === undefined || typeof snapshot.currentValue === "string";
+}
+
+function isAgentReasoningStateSnapshot(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const reasoning = value as Record<string, unknown>;
+  if (typeof reasoning.configId !== "string" || typeof reasoning.updatedAt !== "string") return false;
+  if (!Array.isArray(reasoning.choices)) return false;
+  if (!reasoning.choices.every((choice) => (
+    choice
+    && typeof choice === "object"
+    && !Array.isArray(choice)
+    && typeof (choice as Record<string, unknown>).value === "string"
+    && typeof (choice as Record<string, unknown>).name === "string"
+  ))) return false;
+  if (reasoning.currentValueSource !== undefined && reasoning.currentValueSource !== "probe" && reasoning.currentValueSource !== "session") return false;
+  return reasoning.currentValue === undefined || typeof reasoning.currentValue === "string";
 }
 
 function isAgentRuntimeKind(value: unknown): value is AgentModelStateSnapshot["runtimeKind"] {

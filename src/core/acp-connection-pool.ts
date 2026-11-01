@@ -141,6 +141,11 @@ export class AcpConnectionPool {
         return resumed;
       },
       setConfigOption: (request) => entry.connection.setConfigOption(request),
+      // 可选能力按底层连接的实际实现转发：底层没有 setModel 时包装层也
+      // 不得凭空造出（调用方以缺席判定「不支持变体下发」）。
+      ...(entry.connection.setModel
+        ? { setModel: (request: { sessionId: string; modelId: string }) => entry.connection.setModel!(request) }
+        : {}),
       prompt: (request) => entry.connection.prompt(request),
       cancel: (sessionId) => entry.connection.cancel(sessionId),
       hasSession: (sessionId) => entry.sessions.has(sessionId),

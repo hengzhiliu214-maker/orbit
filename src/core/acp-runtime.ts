@@ -44,6 +44,7 @@ import type {
   AgentId,
   AgentModelChoice,
   AgentModelStateSnapshot,
+  AgentReasoningStateSnapshot,
   AgentRuntimeKind,
   MessageAttachment,
 } from "../shared/types.ts";
@@ -71,6 +72,11 @@ export type AcpConnection = {
   loadSession(request: LoadSessionRequest): Promise<LoadSessionResponse>;
   resumeSession(request: ResumeSessionRequest): Promise<ResumeSessionResponse>;
   setConfigOption(request: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse>;
+  /**
+   * 可选：legacy session/set_model（Codex 变体模型专用）。连接未实现时
+   * 为 undefined，调用方必须明确提示而不是回退到 config option 下发。
+   */
+  setModel?(request: { sessionId: string; modelId: string }): Promise<void>;
   prompt(request: PromptRequest): Promise<PromptResponse>;
   cancel(sessionId: string): Promise<void>;
   hasSession?(sessionId: string): boolean;
@@ -366,7 +372,7 @@ export function runAcp(
       // 会话建立后、prompt 前：先回调模型快照，再尽力应用员工首选模型
       // （issue #142）。切换失败只输出过程提示，绝不让运行失败。
       if (!cancelled && !forcedCancelled) {
-        await applyPreferredModel(connection, activeSessionId, options, definition, session.configOptions);
+        await applyPreferredModel(connection, activeSessionId, options, definition, session.configOptions, session.models);
       }
       // Cancellation may arrive while applying the preferred model. Do not
       // start a prompt after the turn has already entered cancellation.
@@ -481,7 +487,7 @@ export async function probeAcpModelState(
         cwd: path.resolve(probeOptions.cwd),
         mcpServers: [],
       });
-      return toModelSnapshot(created.configOptions, probeOptions, definition, "probe");
+      return toModelSnapshot(created.configOptions, probeOptions, definition, "probe", legacyModelStateOf(created));
     })();
     const deadline = new Promise<never>((_, reject) => {
       timeout = setTimeout(
@@ -575,7 +581,39 @@ export type AcpSessionSetup = {
   sessionId: string;
   configOptions: Array<SessionConfigOption> | null | undefined;
   reusedConnectionSession: boolean;
+  /** legacy models 状态（Codex 变体）；适配器未返回时为 undefined。 */
+  models?: AcpLegacyModelState;
 };
+
+/**
+ * legacy ACP models 状态（session/new、load、resume 响应里的非标准字段，
+ * codex-acp 返回）：availableModels 是带思考强度的变体 modelId 清单，
+ * 只能原样使用、不拼造；configOptions 的 model 只有基础 id，变体经
+ * set_config_option 下发会被适配器拒绝（实测 -32602）。
+ */
+export type AcpLegacyModelState = {
+  availableModels: Array<{ modelId: string; name?: string }>;
+  currentModelId?: string;
+};
+
+export function legacyModelStateOf(response: unknown): AcpLegacyModelState | undefined {
+  if (!response || typeof response !== "object") return undefined;
+  const models = (response as { models?: unknown }).models;
+  if (!models || typeof models !== "object") return undefined;
+  const available = (models as { availableModels?: unknown }).availableModels;
+  if (!Array.isArray(available)) return undefined;
+  const list: Array<{ modelId: string; name?: string }> = [];
+  for (const entry of available) {
+    if (!entry || typeof entry !== "object") continue;
+    const modelId = (entry as { modelId?: unknown }).modelId;
+    if (typeof modelId !== "string" || !modelId) continue;
+    const name = (entry as { name?: unknown }).name;
+    list.push({ modelId, ...(typeof name === "string" && name ? { name } : {}) });
+  }
+  if (list.length === 0) return undefined;
+  const current = (models as { currentModelId?: unknown }).currentModelId;
+  return { availableModels: list, ...(typeof current === "string" && current ? { currentModelId: current } : {}) };
+}
 
 async function prepareSession(
   connection: AcpConnection,
@@ -587,7 +625,12 @@ async function prepareSession(
   const absoluteCwd = path.resolve(cwd);
   if (!existingSessionId) {
     const created = await connection.newSession({ cwd: absoluteCwd, mcpServers: [] });
-    return { sessionId: created.sessionId, configOptions: created.configOptions, reusedConnectionSession: false };
+    return {
+      sessionId: created.sessionId,
+      configOptions: created.configOptions,
+      reusedConnectionSession: false,
+      models: legacyModelStateOf(created),
+    };
   }
 
   if (connection.hasSession?.(existingSessionId)) {
@@ -602,11 +645,21 @@ async function prepareSession(
   };
   if (capabilities?.sessionCapabilities?.resume) {
     const resumed = await connection.resumeSession(request satisfies ResumeSessionRequest);
-    return { sessionId: existingSessionId, configOptions: resumed.configOptions, reusedConnectionSession: false };
+    return {
+      sessionId: existingSessionId,
+      configOptions: resumed.configOptions,
+      reusedConnectionSession: false,
+      models: legacyModelStateOf(resumed),
+    };
   }
   if (capabilities?.loadSession) {
     const loaded = await connection.loadSession(request);
-    return { sessionId: existingSessionId, configOptions: loaded.configOptions, reusedConnectionSession: false };
+    return {
+      sessionId: existingSessionId,
+      configOptions: loaded.configOptions,
+      reusedConnectionSession: false,
+      models: legacyModelStateOf(loaded),
+    };
   }
 
   throw new Error(
@@ -658,7 +711,12 @@ async function restoreOrRecoverSession(
   const absoluteCwd = path.resolve(options.cwd);
   if (!options.resumeSessionId) {
     const created = await connection.newSession({ cwd: absoluteCwd, mcpServers: [] });
-    return { sessionId: created.sessionId, configOptions: created.configOptions, reusedConnectionSession: false };
+    return {
+      sessionId: created.sessionId,
+      configOptions: created.configOptions,
+      reusedConnectionSession: false,
+      models: legacyModelStateOf(created),
+    };
   }
   try {
     return await prepareSession(connection, capabilities, options.cwd, options.resumeSessionId, definition.displayName);
@@ -685,8 +743,53 @@ async function restoreOrRecoverSession(
     options.onOutput?.(
       `原 ${definition.displayName} 会话无法恢复（${summarizeRestoreFailure(error)}），已使用新的会话继续。`,
     );
-    return { sessionId: created.sessionId, configOptions: created.configOptions, reusedConnectionSession: false };
+    return {
+      sessionId: created.sessionId,
+      configOptions: created.configOptions,
+      reusedConnectionSession: false,
+      models: legacyModelStateOf(created),
+    };
   }
+}
+
+/**
+ * 已核实的思考强度配置项（按 runtime 限定语义）：只有 id 与 category 同时命中
+ * 才被认作思考强度。category 只是显示元数据，不是权限分类；sandbox、mode、
+ * multitask 等其他 select 永远不会被当作思考强度持久化或重放。value 集合与
+ * 名称一律以 runtime 实际返回为准，不做跨 runtime 的同义转换。
+ */
+const REASONING_CONFIG_OPTIONS: Partial<Record<AgentRuntimeKind, { id: string; category: string }>> = {
+  codebuddy: { id: "thought_level", category: "thought_level" },
+  // dsh 实测（2026-11-02 session/new 原始响应）：id 为 reasoning_effort，
+  // category 却是 thought_level——配对以 runtime 实际返回为准，不假设
+  // id 与 category 同名。
+  dsh: { id: "reasoning_effort", category: "thought_level" },
+};
+
+/**
+ * 从 runtime 返回的 config options 中抽取思考强度快照。runtime 未提供已核实
+ * 的思考强度配置项时返回 undefined（快照不带 reasoning 字段，UI 不展示该组）。
+ */
+export function toReasoningSnapshot(
+  configOptions: Array<SessionConfigOption> | null | undefined,
+  definition: AcpRuntimeDefinition,
+  currentValueSource: "probe" | "session" = "session",
+): AgentReasoningStateSnapshot | undefined {
+  if (!configOptions) return undefined;
+  const expected = REASONING_CONFIG_OPTIONS[definition.kind];
+  if (!expected) return undefined;
+  const option = configOptions.find(
+    (candidate): candidate is Extract<SessionConfigOption, { type: "select" }> =>
+      candidate.type === "select" && candidate.id === expected.id && candidate.category === expected.category,
+  );
+  if (!option) return undefined;
+  return {
+    configId: option.id,
+    choices: flattenModelChoices(option.options),
+    currentValue: currentValueSource === "session" ? option.currentValue : undefined,
+    currentValueSource,
+    updatedAt: new Date().toISOString(),
+  };
 }
 
 /**
@@ -700,19 +803,52 @@ export function toModelSnapshot(
   options: AcpRunOptions,
   definition: AcpRuntimeDefinition,
   currentValueSource: "probe" | "session" = "session",
+  legacyModels?: AcpLegacyModelState,
 ): AgentModelStateSnapshot | null {
   if (!configOptions) return null;
   const modelOption = configOptions.find(
     (option): option is Extract<SessionConfigOption, { type: "select" }> =>
       option.type === "select" && option.category === "model",
   );
+  const reasoning = toReasoningSnapshot(configOptions, definition, currentValueSource);
+  // Codex 变体路径：适配器枚举出变体清单时，模型清单与当前值以变体为准，
+  // configOptions 的基础 model 不再作为 choices 来源（两条路径不得混用）。
+  if (definition.kind === "codex" && legacyModels && legacyModels.availableModels.length > 0) {
+    return {
+      agentId: options.agentId,
+      runtimeKind: definition.kind,
+      configId: modelOption?.id ?? "",
+      choices: legacyModels.availableModels.map((entry) => ({
+        value: entry.modelId,
+        name: entry.name ?? entry.modelId,
+      })),
+      currentValue: currentValueSource === "session" ? legacyModels.currentModelId : undefined,
+      currentValueSource,
+      modelApplyPath: "session_model",
+      ...(reasoning ? { reasoning } : {}),
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  // 承接规则：本次没有变体数据（如 config_option_update 只带 config
+  // options）时，不得把已确认的变体快照覆盖回基础模型形态——沿用上一次
+  // 会话快照的变体清单与当前值。
+  const carry = !legacyModels &&
+    options.lastSessionConfig?.modelApplyPath === "session_model" &&
+    options.lastSessionConfig.runtimeKind === definition.kind &&
+    options.lastSessionConfig.agentId === options.agentId
+    ? options.lastSessionConfig
+    : undefined;
   return {
     agentId: options.agentId,
     runtimeKind: definition.kind,
     configId: modelOption?.id ?? "",
-    choices: modelOption ? flattenModelChoices(modelOption.options) : [],
-    currentValue: currentValueSource === "session" ? modelOption?.currentValue : undefined,
+    choices: carry ? carry.choices : modelOption ? flattenModelChoices(modelOption.options) : [],
+    currentValue: carry
+      ? carry.currentValue
+      : currentValueSource === "session" ? modelOption?.currentValue : undefined,
     currentValueSource,
+    ...(carry ? { modelApplyPath: "session_model" as const } : {}),
+    ...(reasoning ? { reasoning } : {}),
     updatedAt: new Date().toISOString(),
   };
 }
@@ -742,6 +878,9 @@ function modelLabel(snapshot: { choices: AgentModelChoice[] }, value: string): s
  *
  * 池复用捷径（hasSession 命中，本次没有响应可读）没有新快照，改用上一次运行
  * 的快照（lastSessionConfig）无条件幂等下发 set_config_option。
+ *
+ * 模型之后再处理思考强度（applyPreferredReasoning）：强度偏好的校验依据是
+ * 模型切换响应携带的最新 config options，因为可选强度可能随模型变化。
  */
 async function applyPreferredModel(
   connection: AcpConnection,
@@ -749,28 +888,129 @@ async function applyPreferredModel(
   options: AcpRunOptions,
   definition: AcpRuntimeDefinition,
   configOptions: Array<SessionConfigOption> | null | undefined,
+  legacyModels?: AcpLegacyModelState,
 ): Promise<void> {
-  const snapshot = toModelSnapshot(configOptions, options, definition);
+  const snapshot = toModelSnapshot(configOptions, options, definition, "session", legacyModels);
   if (snapshot) options.onSessionConfig?.(snapshot);
+  let latestConfigOptions = configOptions;
   const preferred = options.preferredModelId?.trim();
+  if (preferred) {
+    const last = options.lastSessionConfig;
+    const reference =
+      snapshot
+      ?? (last && last.runtimeKind === definition.kind && last.agentId === options.agentId ? last : null);
+    if (reference && reference.modelApplyPath === "session_model" && reference.choices.length > 0) {
+      // Codex 变体路径（唯一权威路径）：只经 legacy session/set_model 下发
+      // 枚举到的变体 modelId；绝不回退 config option（变体 id 会被适配器
+      // 拒绝，基础 id 会丢掉强度）。适配器对 set_model 不发确认通知，
+      // 成功后以偏好值回写已确认当前值，快照即生效记录。
+      if (reference.currentValue === preferred) {
+        // 已是首选变体，无需下发。
+      } else if (!reference.choices.some((choice) => choice.value === preferred)) {
+        const current = reference.currentValue ? modelLabel(reference, reference.currentValue) : "默认模型";
+        emitModelNotice(
+          options,
+          `${definition.displayName} 首选模型 ${preferred} 未在当前变体清单内，未做替换，继续使用 ${current}。`,
+        );
+      } else if (!connection.setModel) {
+        const current = reference.currentValue ? modelLabel(reference, reference.currentValue) : "默认模型";
+        emitModelNotice(
+          options,
+          `${definition.displayName} 连接不支持变体模型下发，未做替换，继续使用 ${current}。`,
+        );
+      } else {
+        try {
+          await connection.setModel({ sessionId, modelId: preferred });
+          options.onSessionConfig?.({
+            ...reference,
+            currentValue: preferred,
+            currentValueSource: "session",
+            updatedAt: new Date().toISOString(),
+          });
+          emitModelNotice(options, `${definition.displayName} 模型已切换为 ${modelLabel(reference, preferred)}。`);
+        } catch (error) {
+          emitModelNotice(
+            options,
+            `${definition.displayName} 模型切换失败（${summarizeRestoreFailure(error)}），继续使用当前模型。`,
+          );
+        }
+      }
+    } else if (reference && reference.configId && reference.choices.length > 0) {
+      if (reference.currentValue === preferred) {
+        // 已是首选模型，无需下发。
+      } else if (!reference.choices.some((choice) => choice.value === preferred)) {
+        const current = reference.currentValue ? modelLabel(reference, reference.currentValue) : "默认模型";
+        emitModelNotice(
+          options,
+          `${definition.displayName} 首选模型 ${modelLabel(reference, preferred)} 当前不可用，继续使用 ${current}。`,
+        );
+      } else {
+        try {
+          const response = await connection.setConfigOption({
+            sessionId,
+            configId: reference.configId,
+            value: preferred,
+          });
+          latestConfigOptions = response.configOptions ?? latestConfigOptions;
+          const updated = toModelSnapshot(response.configOptions, options, definition);
+          if (updated) options.onSessionConfig?.(updated);
+          emitModelNotice(options, `${definition.displayName} 模型已切换为 ${modelLabel(updated ?? reference, preferred)}。`);
+        } catch (error) {
+          emitModelNotice(
+            options,
+            `${definition.displayName} 模型切换失败（${summarizeRestoreFailure(error)}），继续使用当前模型。`,
+          );
+        }
+      }
+    }
+  }
+  await applyPreferredReasoning(connection, sessionId, options, definition, latestConfigOptions);
+}
+
+/**
+ * 应用员工首选思考强度（在模型之后调用）。合同：
+ * - 以目标会话的实时 config options 为准；本次有响应时只认响应里的选项，
+ *   池复用无响应时才回退 lastSessionConfig 的思考强度快照；
+ * - 偏好为空即跟随运行时默认，不下发、不落盘为偏好；
+ * - 偏好不在最新选项内时明确提示「当前不可用、未做替换」，绝不静默换档，
+ *   也不谎称已应用；命中且与当前值不同才下发 set_config_option；
+ * - 恢复会话每回合都会重走本函数，等于每次都重新校验。
+ */
+async function applyPreferredReasoning(
+  connection: AcpConnection,
+  sessionId: string,
+  options: AcpRunOptions,
+  definition: AcpRuntimeDefinition,
+  configOptions: Array<SessionConfigOption> | null | undefined,
+): Promise<void> {
+  const preferred = options.preferredReasoningValue?.trim();
   if (!preferred) return;
-
-  const last = options.lastSessionConfig;
-  const reference =
-    snapshot
-    ?? (last && last.runtimeKind === definition.kind && last.agentId === options.agentId ? last : null);
-  if (!reference || !reference.configId || reference.choices.length === 0) return;
-
-  if (reference.currentValue === preferred) return;
-  if (!reference.choices.some((choice) => choice.value === preferred)) {
-    const current = reference.currentValue ? modelLabel(reference, reference.currentValue) : "默认模型";
+  if (!REASONING_CONFIG_OPTIONS[definition.kind]) return;
+  let reference: AgentReasoningStateSnapshot | undefined;
+  if (configOptions) {
+    reference = toReasoningSnapshot(configOptions, definition);
+  } else {
+    const last = options.lastSessionConfig;
+    if (last && last.runtimeKind === definition.kind && last.agentId === options.agentId) {
+      reference = last.reasoning;
+    }
+  }
+  if (!reference || reference.choices.length === 0) {
     emitModelNotice(
       options,
-      `${definition.displayName} 首选模型 ${modelLabel(reference, preferred)} 当前不可用，继续使用 ${current}。`,
+      `${definition.displayName} 首选思考强度当前不可用（运行时未提供该选项），未做替换，继续使用当前设置。`,
     );
     return;
   }
-
+  if (reference.currentValue === preferred) return;
+  if (!reference.choices.some((choice) => choice.value === preferred)) {
+    const current = reference.currentValue ? modelLabel(reference, reference.currentValue) : "运行时默认";
+    emitModelNotice(
+      options,
+      `${definition.displayName} 首选思考强度 ${preferred} 当前不可用，继续使用 ${current}，未做替换。`,
+    );
+    return;
+  }
   try {
     const response = await connection.setConfigOption({
       sessionId,
@@ -779,11 +1019,14 @@ async function applyPreferredModel(
     });
     const updated = toModelSnapshot(response.configOptions, options, definition);
     if (updated) options.onSessionConfig?.(updated);
-    emitModelNotice(options, `${definition.displayName} 模型已切换为 ${modelLabel(updated ?? reference, preferred)}。`);
+    emitModelNotice(
+      options,
+      `${definition.displayName} 思考强度已切换为 ${modelLabel(updated?.reasoning ?? reference, preferred)}。`,
+    );
   } catch (error) {
     emitModelNotice(
       options,
-      `${definition.displayName} 模型切换失败（${summarizeRestoreFailure(error)}），继续使用当前模型。`,
+      `${definition.displayName} 思考强度切换失败（${summarizeRestoreFailure(error)}），继续使用当前设置。`,
     );
   }
 }
@@ -1560,6 +1803,7 @@ function connectionFromProcess(
     loadSession: (params) => request(acp.agent.request(methods.agent.session.load, params)),
     resumeSession: (params) => request(acp.agent.request(methods.agent.session.resume, params)),
     setConfigOption: (params) => request(acp.agent.request(methods.agent.session.setConfigOption, params)),
+    setModel: (params) => request(acp.agent.request("session/set_model", params)).then(() => undefined),
     prompt: (params) => request(acp.agent.request(methods.agent.session.prompt, params)),
     cancel: (sessionId) => request(acp.agent.notify(methods.agent.session.cancel, { sessionId })),
     close,
