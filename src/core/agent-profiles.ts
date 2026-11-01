@@ -25,7 +25,7 @@ export function createSupervisorProfile(cwd: string, config: SupervisorConfig): 
   };
 }
 
-const CONFIGURABLE_RUNTIME_KINDS = new Set<AgentRuntimeKind>(["claude-code", "codex", "codebuddy", "dsh"]);
+const CONFIGURABLE_RUNTIME_KINDS = new Set<AgentRuntimeKind>(["claude-code", "codex", "codebuddy", "dsh", "workbuddy"]);
 
 export function parseAgentRuntimeOverrides(value: string | undefined): AgentRuntimeOverrides {
   const overrides: AgentRuntimeOverrides = {};

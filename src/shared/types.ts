@@ -80,12 +80,12 @@ export type PendingPermission = AgentPermissionRequest & {
   expiresAt: string;
 };
 
-export type AgentRuntimeKind = "claude-code" | "codex" | "codebuddy" | "dsh";
+export type AgentRuntimeKind = "claude-code" | "codex" | "codebuddy" | "dsh" | "workbuddy";
 
-export const AGENT_RUNTIME_KINDS: readonly AgentRuntimeKind[] = ["claude-code", "codex", "codebuddy", "dsh"];
+export const AGENT_RUNTIME_KINDS: readonly AgentRuntimeKind[] = ["claude-code", "codex", "codebuddy", "dsh", "workbuddy"];
 
 export function isAgentRuntimeKind(value: unknown): value is AgentRuntimeKind {
-  return value === "claude-code" || value === "codex" || value === "codebuddy" || value === "dsh";
+  return value === "claude-code" || value === "codex" || value === "codebuddy" || value === "dsh" || value === "workbuddy";
 }
 
 export type ChannelWatchTriggers = {

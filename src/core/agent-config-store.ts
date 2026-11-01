@@ -5,7 +5,7 @@ import { type AgentConfig, type AgentId, type AgentRuntimeKind, type AgentTeamTe
 
 export type { AgentConfig };
 
-const VALID_RUNTIMES = new Set<AgentRuntimeKind>(["claude-code", "codex", "codebuddy", "dsh"]);
+const VALID_RUNTIMES = new Set<AgentRuntimeKind>(["claude-code", "codex", "codebuddy", "dsh", "workbuddy"]);
 const RESERVED_IDS = new Set(["all", "user", "supervisor"]);
 const ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
 const NAME_PATTERN = /^[^\s@:]+$/u;
