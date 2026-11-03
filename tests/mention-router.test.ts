@@ -54,3 +54,15 @@ test("matchAssignmentPrefix shares the routing marker semantics", () => {
   assert.equal(matchAssignmentPrefix("@甄架构"), null);
   assert.equal(matchAssignmentPrefix(""), null);
 });
+
+test("full-width colon separator is not swallowed into the name when the body has more colons", () => {
+  // 回归：分隔符是全角冒号且正文里再出现冒号（全角或半角）时，名称不得把
+  // 第一个全角冒号吞进去，否则整段被当成未知名称而不路由。
+  const fullWidth = routeMention("@甄架构：把标题改成：新标题", agents);
+  assert.equal(fullWidth.kind, "assignments");
+  if (fullWidth.kind === "assignments") assert.deepEqual(fullWidth.agentIds, ["agent1"]);
+  const halfWidthBody = routeMention("@甄架构：把时间改成:明天", agents);
+  assert.equal(halfWidthBody.kind, "assignments");
+  if (halfWidthBody.kind === "assignments") assert.deepEqual(halfWidthBody.agentIds, ["agent1"]);
+  assert.deepEqual(matchAssignmentPrefix("@甄架构：把标题改成：新标题"), { name: "甄架构", end: 5 });
+});

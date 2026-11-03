@@ -187,6 +187,8 @@ function pooledAcpConnector(
 type ToolState = {
   name: string;
   status?: ToolCallStatus | null;
+  contentSummary?: string;
+  rawSummary?: string;
 };
 
 type AnswerMessage = {
@@ -678,6 +680,13 @@ export type AcpSessionRestoreClassification = "recoverable" | "unrecoverable";
 export function classifySessionRestoreError(error: unknown): AcpSessionRestoreClassification | null {
   const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
   if (/thread-store conflict|active writer|session (not found|corrupt|damaged|expired)|invalid session/.test(message)) {
+    return "unrecoverable";
+  }
+  // Agent 以 JSON-RPC 内部错误拒绝恢复（实测 dsh 跨进程 resume 返回 -32603
+  // "Internal error"）：错误文本不带会话状态细节，但原会话在该进程内已不可
+  // 恢复；按不可恢复降级新建会话，好过整轮以裸错误在建立阶段失败。
+  const errorCode = (error as { code?: unknown } | null | undefined)?.code;
+  if (errorCode === -32603 || message.includes("internal error")) {
     return "unrecoverable";
   }
   if (/transport|connection closed|timeout|timed out|process exited|process failed|econnreset|econnrefused|epipe|socket hang up|aborted/.test(message)) {
@@ -1240,7 +1249,16 @@ function handleSessionUpdate(
   const previous = toolStates.get(update.toolCallId);
   const name = update.name ?? update.title ?? previous?.name ?? update.kind ?? "tool";
   const status = update.status ?? previous?.status;
-  toolStates.set(update.toolCallId, { name, status });
+  // ACP updates may send content before the terminal status and replace the
+  // collection on later updates. Keep only bounded displayable text.
+  const contentSummary = update.content == null
+    ? previous?.contentSummary
+    : formatValue(update.content.flatMap((item) =>
+      item.type === "content" && item.content.type === "text" ? [item.content.text] : [],
+    ).join("\n")) || undefined;
+  const rawSummary = update.rawOutput === undefined ? previous?.rawSummary : formatValue(update.rawOutput);
+  const summary = rawSummary ?? contentSummary;
+  toolStates.set(update.toolCallId, { name, status, contentSummary, rawSummary });
 
   if (!previous && status !== "completed" && status !== "failed") {
     emitActivity(options, {
@@ -1256,7 +1274,7 @@ function handleSessionUpdate(
       type: "tool.completed",
       toolCallId: update.toolCallId,
       name,
-      ...(update.rawOutput === undefined ? {} : { summary: formatValue(update.rawOutput) }),
+      ...(summary === undefined ? {} : { summary }),
       timestamp: new Date().toISOString(),
     });
     const projected = definition.projectToolCompletion?.(update);
@@ -1267,7 +1285,7 @@ function handleSessionUpdate(
       type: "tool.failed",
       toolCallId: update.toolCallId,
       name,
-      ...(update.rawOutput === undefined ? {} : { summary: formatValue(update.rawOutput) }),
+      ...(summary === undefined ? {} : { summary }),
       timestamp: new Date().toISOString(),
     });
   }

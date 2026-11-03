@@ -8,7 +8,9 @@ export type MentionRouteResult =
 
 type AssignmentMarker = { name: string; start: number; end: number; agentId?: AgentId };
 
-const assignmentMarkerSource = "@([^\\s@:]+)\\s*(?::|：)";
+// 全角冒号与半角冒号同为指派分隔符，名称字符类必须同时排除两者：否则名称
+// 会吞掉第一个全角冒号，正文里再出现任一冒号时整段被当成未知名称而不路由。
+const assignmentMarkerSource = "@([^\\s@:：]+)\\s*(?::|：)";
 
 export const assignmentPattern = new RegExp(assignmentMarkerSource, "gu");
 

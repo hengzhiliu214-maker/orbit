@@ -7,7 +7,7 @@ import { INTERNAL_SUPERVISOR_ID } from "../core/agent-profiles.ts";
 import { matchAssignmentPrefix } from "../core/mention-router.ts";
 import { resolveSlashCommandTarget } from "../core/native-commands.ts";
 import { matchPreset } from "../core/workspace-presets.ts";
-import { type AgentActivityEvent, type AgentCommand, type AgentCommandsSnapshot, type AgentConfig, type AgentConfigWithModelState, type AgentId, type AgentModelPreference, type AgentModelProbeResponse, type AgentModelProbeState, type AgentModelStateSnapshot, type AgentPlanSnapshot, type AgentRuntimeKind, type AgentState, type AgentTeamTemplate, type AppState, type ApprovalMode, type ChatMessage, type Conversation, type ConversationInfo, type DraftAttachmentInfo, type ElicitationContent, type ElicitationFieldSchema, type ElicitationResponse, type InteractionMode, type MessagePage, type PendingElicitation, type PendingPermission, type PermissionDecision, type PersistedProcessTimelineEntry, type RunningSummary, type RuntimeEvent, type SupervisorConfig, type Workspace, type WorkspacePreset, ATTACHMENT_LIMITS } from "../shared/types.ts";
+import { type AgentActivityEvent, type AgentCommand, type AgentCommandsSnapshot, type AgentConfig, type AgentConfigWithModelState, type AgentId, type AgentModelChoice, type AgentModelPreference, type AgentModelProbeResponse, type AgentModelProbeState, type AgentModelStateSnapshot, type AgentPlanSnapshot, type AgentRuntimeKind, type AgentState, type AgentTeamTemplate, type AppState, type ApprovalMode, type ChatMessage, type Conversation, type ConversationInfo, type DraftAttachmentInfo, type ElicitationContent, type ElicitationFieldSchema, type ElicitationResponse, type InteractionMode, type MessagePage, type PendingElicitation, type PendingPermission, type PermissionDecision, type PersistedProcessTimelineEntry, type RunningSummary, type RuntimeEvent, type SupervisorConfig, type Workspace, type WorkspacePreset, ATTACHMENT_LIMITS } from "../shared/types.ts";
 import { attachmentAcceptAttribute } from "../shared/attachment-registry.ts";
 import { canSendMessage } from "../shared/message-validation.ts";
 import { createAttachmentUploadLifecycle } from "./attachment-upload-state.ts";
@@ -952,6 +952,24 @@ export function App() {
       setState((current) => ({ ...current, messages: [...current.messages, createLocalSystemMessage(error instanceof Error ? error.message : `${label}切换失败`)] }));
     } finally {
       setIsSwitchingInteractionMode(false);
+    }
+  }
+
+
+  async function updateDefaultDirectAgent(agentId: string) {
+    const conversationId = state.conversation.id;
+    if (!conversationId) return;
+    try {
+      const response = await fetch(withPageContext(`/api/conversations/${conversationId}/default-agent`, currentPageContext()), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ agentId: agentId === "" ? null : agentId }),
+      });
+      const body = await response.json() as { conversation?: ConversationInfo; message?: string };
+      if (!response.ok || !body.conversation) throw new Error(body.message ?? "默认接收员工设置失败");
+      setState((current) => ({ ...current, conversation: body.conversation! }));
+    } catch (error) {
+      setState((current) => ({ ...current, messages: [...current.messages, createLocalSystemMessage(error instanceof Error ? error.message : "默认接收员工设置失败")] }));
     }
   }
 
@@ -2191,6 +2209,22 @@ export function App() {
                   </div>
                 ) : null}
               </div>
+              {interactionMode === "direct" ? (
+                <label className="defaultReceiverControl" title="普通对话下不带 @ 的消息固定发给这位员工">
+                  <span>发送给</span>
+                  <select
+                    aria-label="默认接收员工"
+                    value={state.conversation.lastDirectAgentId ?? ""}
+                    onChange={(event) => { void updateDefaultDirectAgent(event.target.value); }}
+                    disabled={!hasWorkspace || !hasEnabledAgent}
+                  >
+                    <option value="">未指定（需 @）</option>
+                    {state.agents.filter((agent) => agent.id !== INTERNAL_SUPERVISOR_ID).map((agent) => (
+                      <option key={agent.id} value={agent.id}>{agent.label}</option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
               <div className="approvalModeControl">
                 <button
                   type="button"
@@ -3875,7 +3909,10 @@ function AgentModelField({ config, snapshot, probe, onChange, onRefreshModels, i
     : undefined;
   const probeStatus = probe?.status ?? (snapshot ? (snapshot.choices.length > 0 ? "ready" : "unsupported") : "idle");
   const choices = probeStatus === "ready" ? snapshot?.choices ?? [] : [];
-  const nameOf = (value: string) => choices.find((choice) => choice.value === value)?.name ?? value;
+  // 快照可能过期：已保存的首选不在列表中时补成一项显示，保证设置页的当前值
+  // 以已保存偏好为准，而不是被过期快照的上次会话值误导（settings-save-guard）。
+  const displayChoices = probeStatus === "ready" ? modelChoicesWithSavedPreference(choices, preferred) : choices;
+  const nameOf = (value: string) => displayChoices.find((choice) => choice.value === value)?.name ?? value;
   const preferredMissing = probeStatus === "ready"
     && preferred !== undefined
     && !choices.some((choice) => choice.value === preferred);
@@ -3883,7 +3920,8 @@ function AgentModelField({ config, snapshot, probe, onChange, onRefreshModels, i
   const reasoningPreferred = config.model?.runtimeKind === config.runtime
     ? config.model?.preferredReasoningValue?.trim() || undefined
     : undefined;
-  const reasoningNameOf = (value: string) => reasoning?.choices.find((choice) => choice.value === value)?.name ?? value;
+  const reasoningDisplayChoices = modelChoicesWithSavedPreference(reasoning?.choices ?? [], reasoningPreferred);
+  const reasoningNameOf = (value: string) => reasoningDisplayChoices.find((choice) => choice.value === value)?.name ?? value;
   const reasoningMissing = reasoning !== undefined
     && reasoningPreferred !== undefined
     && !reasoning.choices.some((choice) => choice.value === reasoningPreferred);
@@ -3920,7 +3958,7 @@ function AgentModelField({ config, snapshot, probe, onChange, onRefreshModels, i
           />
           <span>跟随运行时默认{probeStatus === "ready" && snapshot?.currentValueSource === "session" && snapshot.currentValue ? `（当前：${nameOf(snapshot.currentValue)}）` : ""}</span>
         </label>
-        {choices.map((choice) => (
+        {displayChoices.map((choice) => (
           <label key={choice.value} className={`modelChoice ${preferred === choice.value ? "modelChoiceActive" : ""}`}>
             <input
               type="radio"
@@ -3936,6 +3974,7 @@ function AgentModelField({ config, snapshot, probe, onChange, onRefreshModels, i
             />
             <span>
               {choice.name}
+              {preferredMissing && choice.value === preferred ? "（已保存的首选）" : ""}
               {probeStatus === "ready" && snapshot?.currentValueSource === "session" && snapshot.currentValue === choice.value && preferred !== choice.value ? "（当前）" : ""}
             </span>
           </label>
@@ -3948,7 +3987,7 @@ function AgentModelField({ config, snapshot, probe, onChange, onRefreshModels, i
       ) : probeStatus === "loading" ? (
         <div className="modelHint">正在获取模型列表...</div>
       ) : preferredMissing ? (
-        <div className="modelHint modelHintWarn">首选模型 {nameOf(preferred)} 当前不可用，下次运行将继续使用当前模型并在对话中提示。</div>
+        <div className="modelHint modelHintWarn">首选模型 {nameOf(preferred)} 不在当前列表中（列表可能已过期），上方仍按已保存的首选显示；点击「刷新模型列表」可更新列表。若刷新后仍不可用，下次运行将继续使用当前模型并在对话中提示。</div>
       ) : null}
       {reasoning && reasoning.choices.length > 0 ? (
         <>
@@ -3965,7 +4004,7 @@ function AgentModelField({ config, snapshot, probe, onChange, onRefreshModels, i
               />
               <span>跟随运行时默认{reasoning.currentValueSource === "session" && reasoning.currentValue ? `（当前：${reasoningNameOf(reasoning.currentValue)}）` : ""}</span>
             </label>
-            {reasoning.choices.map((choice) => (
+            {reasoningDisplayChoices.map((choice) => (
               <label key={choice.value} className={`modelChoice ${reasoningPreferred === choice.value ? "modelChoiceActive" : ""}`}>
                 <input
                   type="radio"
@@ -3975,13 +4014,14 @@ function AgentModelField({ config, snapshot, probe, onChange, onRefreshModels, i
                 />
                 <span>
                   {choice.name}
+                  {reasoningMissing && choice.value === reasoningPreferred ? "（已保存的首选）" : ""}
                   {reasoning.currentValueSource === "session" && reasoning.currentValue === choice.value && reasoningPreferred !== choice.value ? "（当前）" : ""}
                 </span>
               </label>
             ))}
           </div>
           {reasoningMissing ? (
-            <div className="modelHint modelHintWarn">首选思考强度 {reasoningNameOf(reasoningPreferred ?? "")} 当前不可用，下次运行将继续使用当前设置并在对话中提示，不会自动替换。</div>
+            <div className="modelHint modelHintWarn">首选思考强度 {reasoningNameOf(reasoningPreferred ?? "")} 不在当前列表中（列表可能已过期），仍按已保存的首选显示；刷新模型列表可更新列表，不会自动替换。</div>
           ) : null}
         </>
       ) : null}
@@ -3991,6 +4031,21 @@ function AgentModelField({ config, snapshot, probe, onChange, onRefreshModels, i
       <div className="modelHint">模型与思考强度选择在该数字员工下次运行时生效。</div>
     </div>
   );
+}
+
+/**
+ * 选项列表补齐已保存的首选（settings-save-guard）：快照可能过期（如新模型
+ * 通道接通前留下的列表），此时已保存的首选不在可选列表里，单选组会出现
+ * 「没有任何一项被选中、过期值反而被标注为当前」的误导状态。把首选补成
+ * 一项渲染出来，保证设置页显示的当前值始终以已保存的偏好为准；快照只
+ * 提供可选项列表，不决定当前值。
+ */
+export function modelChoicesWithSavedPreference(
+  choices: AgentModelChoice[],
+  preferred: string | undefined,
+): AgentModelChoice[] {
+  if (!preferred || choices.some((choice) => choice.value === preferred)) return choices;
+  return [...choices, { value: preferred, name: preferred }];
 }
 
 export function mergeProbedConfigs(

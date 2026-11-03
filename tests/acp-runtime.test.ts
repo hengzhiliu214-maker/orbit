@@ -569,6 +569,35 @@ test("an unrecoverable resume failure falls back to a fresh session", async () =
   assert.ok(output.some((text) => text.includes("thread-store conflict")), `expected failure summary in: ${output.join(" | ")}`);
 });
 
+test("an opaque internal-error resume failure falls back to a fresh session", async () => {
+  // 实测复现（2026-11-03）：Orbit 重启后，dsh 既有会话在新进程里 resume
+  // 被以 JSON-RPC -32603 "Internal error" 拒绝；分类器此前不认这类错误，
+  // 整轮在会话建立阶段以裸 Internal error 失败。按不可恢复降级新建会话。
+  const output: string[] = [];
+  const fake = fakeConnector({
+    resumeCapability: true,
+    answerText: "答复文本",
+    resumeError: Object.assign(new Error("Internal error"), { code: -32603 }),
+  });
+  const handle = runAcp(
+    runOptions({
+      resumeSessionId: "old-session",
+      onOutput: (text: string) => output.push(text),
+    }),
+    definition,
+    fake.connector,
+  );
+
+  const answer = await handle.result;
+  assert.equal(answer, "答复文本");
+  assert.equal(await handle.sessionId, "fake-session", "降级后 sessionId 必须落定新会话的 id");
+  assert.ok(fake.calls.includes("session/resume:1:old-session"), "恢复失败前必须先尝试 resume");
+  assert.ok(fake.calls.includes("session/new:1"), "内部错误拒绝恢复必须新建会话");
+  assert.ok(fake.calls.includes("session/prompt:fake-session"), "新建会话后 prompt 必须使用新 id");
+  assert.equal(fake.spawnCount, 1, "不可恢复降级不换连接");
+  assert.ok(output.some((text) => text.includes("已使用新的会话继续")), "expected downgrade notice in output");
+});
+
 test("a recoverable resume failure retries the same session id on a fresh connection", async () => {
   // Issue #141：传输断开/超时/进程退出只会让连接失效，会话本身仍有效——
   // 销毁当前 lease，用新连接和同一个 sessionId 重试一次。

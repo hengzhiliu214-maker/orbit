@@ -10,6 +10,7 @@ import { disposeAcpConnectionPool, probeAcpModelState } from "../core/acp-runtim
 import { defaultAcpRunnerRegistry } from "../core/acp-runner-registry.ts";
 import { AGENT_TEAM_TEMPLATES, AgentConfigStore, validateAgentConfigs } from "../core/agent-config-store.ts";
 import { AgentModelStateStore, supervisorStorageKey } from "../core/agent-model-state-store.ts";
+import { findStaleSnapshotPreferenceOverwrite } from "../core/agent-model-guard.ts";
 import { probeAllRuntimes, runtimeKindToCliKey, type RuntimeProbeResult } from "../core/runtime-probe.ts";
 import type { AgentConfig } from "../core/agent-config-store.ts";
 import { WorkspaceConfigStore } from "../core/workspace-config-store.ts";
@@ -1638,6 +1639,37 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+
+    // 默认接收员工（Dot 0076）：普通对话模式下无 @ 消息的固定收件人。
+    // 只改会话记录，不发送任何消息；agentId 必须是本工作区员工，null 为清除。
+    if (req.method === "PUT" && url.pathname.startsWith("/api/conversations/") && url.pathname.endsWith("/default-agent")) {
+      const parts = url.pathname.split("/");
+      const convId = parts[3];
+      if (!convId) { sendJson(res, 400, { ok: false, message: "Missing conversation id." }); return; }
+      const target = resolveTarget(url);
+      if (!target || target.conversationId !== convId) {
+        sendJson(res, 409, { ok: false, message: "workspaceId and conversationId are required." });
+        return;
+      }
+      const input = (await readJson(req)) as { agentId?: unknown };
+      if (input.agentId !== null && typeof input.agentId !== "string") {
+        sendJson(res, 400, { ok: false, message: "agentId (string or null) is required." });
+        return;
+      }
+      const ctx = contextForTarget(target);
+      if (!ctx) { sendJson(res, 409, { ok: false, message: "No active conversation context." }); return; }
+      try {
+        const current = conversationStoreFor(target.workspaceId).get(target.workspaceId, convId);
+        if (!current) throw new Error("Conversation not found.");
+        ctx.setDefaultDirectAgent(input.agentId as AgentId | null);
+        const updated = conversationStoreFor(target.workspaceId).get(target.workspaceId, convId) ?? current;
+        sendJson(res, 200, { ok: true, conversation: updated });
+      } catch (error) {
+        sendJson(res, 409, { ok: false, message: error instanceof Error ? error.message : String(error) });
+      }
+      return;
+    }
+
     if (req.method === "PUT" && url.pathname.startsWith("/api/conversations/")) {
       const parts = url.pathname.split("/");
       const convId = parts[3];
@@ -2164,6 +2196,21 @@ async function handlePutAgents(req: http.IncomingMessage, res: http.ServerRespon
 
   // modelState 是 GET 响应合并的运行时快照，保存前剥离，避免污染 agents.json。
   const configs = input.map(({ modelState: _modelState, modelProbe: _modelProbe, ...config }) => config);
+  // 设置页保存防护：载荷偏好若恰好等于过期会话快照的当前值、且与库内已保存
+  // 偏好不同，拒绝保存，避免把较新的模型偏好静默盖回旧值。刷新模型列表后
+  // 快照更新为探测来源，同一保存即可通过（见 agent-model-guard.ts）。
+  const staleOverwrite = findStaleSnapshotPreferenceOverwrite(
+    configStore.load(workspaceId),
+    configs,
+    agentModelStateStore.load(workspaceId),
+  );
+  if (staleOverwrite) {
+    sendJson(res, 409, {
+      ok: false,
+      message: `员工「${staleOverwrite.agentName}」的${staleOverwrite.field === "model" ? "模型" : "思考强度"}偏好已拒绝保存：提交的值与一份较早的会话记录相同，可能来自过期的模型列表，保存会覆盖较新的偏好。请在设置页点击「刷新模型列表」后重新保存。`,
+    });
+    return;
+  }
   configStore.save(workspaceId, configs);
   refreshEnabledAgentsForWorkspace(workspaceId, configs);
   if (workspaceId === activeWorkspaceId) allConfigs = configs;
