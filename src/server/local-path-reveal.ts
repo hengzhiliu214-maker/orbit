@@ -62,7 +62,23 @@ export async function resolveRevealTarget(rawPath: string, roots: string[]): Pro
   }
   // 默认决策 D2：仅允许定位到已配置工作区内的路径，防止消息内容把资源
   // 管理器指向任意本机目录（issue #143）。
-  if (!isInsideWorkspaces(resolved, roots)) {
+  // candidate 已经走过 fs.realpath，是真实路径；而 roots 来自配置串，可能是
+  // 软链或未真实化的路径。比较前把每个根也解析为真实路径，使两侧对称——
+  // 否则 macOS 上 /var → /private/var 会让界内目标被误判为界外（403），
+  // 生产同样受影响。不存在 / 空 / 非法的根直接丢弃：既不扩大授权范围，
+  // 也不会因 realpath 失败抛错产生 500。realpath 必须传配置原值：目录名的
+  // 尾部空格是路径的一部分，trim 会把它换成另一个真实目录，使本应界外拒绝
+  // 的目标被错误放行。
+  const resolvedRoots: string[] = [];
+  for (const root of roots) {
+    // trim 只用于判空：纯空白根不能被当成相对路径交给 realpath 按 cwd 解析；
+    // 交给 realpath 的仍是配置原值，保留目录名尾部空格。其余解析失败由
+    // realpathOrNull 返回 null 丢弃（fail-closed，不抛 500）。
+    if (typeof root !== "string" || root.trim().length === 0) continue;
+    const realRoot = await realpathOrNull(root);
+    if (realRoot) resolvedRoots.push(realRoot);
+  }
+  if (!isInsideWorkspaces(resolved, resolvedRoots)) {
     return {
       ok: false,
       status: 403,
