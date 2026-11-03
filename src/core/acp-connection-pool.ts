@@ -20,6 +20,8 @@ type Entry = {
   leased: boolean;
   lastUsedAt: number;
   timer?: NodeJS.Timeout;
+  /** 连接世代：条目（即底层 agent 进程）创建时分配，进程内单调递增（Dot 0094）。 */
+  generation: number;
 };
 
 export type AcpReusableConnectionFactory = (
@@ -36,6 +38,11 @@ export type AcpConnectionPoolOptions = {
 
 export class AcpConnectionPool {
   private readonly entries = new Map<string, Entry>();
+  /** 连接世代计数与「会话 → 创建它的连接世代」登记（Dot 0094）：池是进程内
+   * 单例，登记不到来源世代的会话必然创建于本 Orbit 进程启动之前（绑定是
+   * 从磁盘恢复的），其创建进程已经不存在。 */
+  private nextGeneration = 0;
+  private readonly sessionGenerations = new Map<string, number>();
   private readonly ttlMs: number;
   private readonly maxIdleProcesses: number;
   private readonly now: () => number;
@@ -67,6 +74,7 @@ export class AcpConnectionPool {
         key,
         connection: this.factory(definition, options, onSessionUpdate),
         sessions: new Set(),
+        generation: ++this.nextGeneration,
         leased: false,
         lastUsedAt: this.now(),
       };
@@ -119,8 +127,13 @@ export class AcpConnectionPool {
       this.destroyEntry(entry);
     };
 
+    const sessionGenerations = this.sessionGenerations;
     return {
       pid: entry.connection.pid,
+      // 连接世代信息（Dot 0094）：供会话恢复分类判定「恢复尝试是否发生在
+      // 与创建该会话不同的进程世代」。
+      connectionGeneration: entry.generation,
+      sessionGeneration: (sessionId: string) => sessionGenerations.get(sessionId),
       initialize: (request) => {
         entry.initialized ??= entry.connection.initialize(request);
         return entry.initialized;
@@ -128,19 +141,27 @@ export class AcpConnectionPool {
       newSession: async (request) => {
         const created = await entry.connection.newSession(request);
         entry.sessions.add(created.sessionId);
+        sessionGenerations.set(created.sessionId, entry.generation);
         return created;
       },
       loadSession: async (request) => {
         const loaded = await entry.connection.loadSession(request);
         entry.sessions.add(request.sessionId);
+        sessionGenerations.set(request.sessionId, entry.generation);
         return loaded;
       },
       resumeSession: async (request) => {
         const resumed = await entry.connection.resumeSession(request);
         entry.sessions.add(request.sessionId);
+        sessionGenerations.set(request.sessionId, entry.generation);
         return resumed;
       },
       setConfigOption: (request) => entry.connection.setConfigOption(request),
+      // 可选能力按底层连接的实际实现转发：底层没有 setModel 时包装层也
+      // 不得凭空造出（调用方以缺席判定「不支持变体下发」）。
+      ...(entry.connection.setModel
+        ? { setModel: (request: { sessionId: string; modelId: string }) => entry.connection.setModel!(request) }
+        : {}),
       prompt: (request) => entry.connection.prompt(request),
       cancel: (sessionId) => entry.connection.cancel(sessionId),
       hasSession: (sessionId) => entry.sessions.has(sessionId),
