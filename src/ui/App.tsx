@@ -11,7 +11,7 @@ import { type AgentActivityEvent, type AgentCommand, type AgentCommandsSnapshot,
 import { attachmentAcceptAttribute } from "../shared/attachment-registry.ts";
 import { canSendMessage } from "../shared/message-validation.ts";
 import { createAttachmentUploadLifecycle } from "./attachment-upload-state.ts";
-import { createDefaultAgentChangeTracker } from "./default-agent-change-state.ts";
+import { createDefaultAgentChangeTracker, type DefaultAgentChangeRequest } from "./default-agent-change-state.ts";
 import { createConversationForUpload } from "./attachment-upload-conversation.ts";
 import { appendTransientProcessActivity, collapseToolExecutions, type ProcessToolActivity, type ProcessToolExecution } from "../shared/process-activity.ts";
 import { WorkAnalysisPanel } from "./WorkAnalysisPanel.tsx";
@@ -283,10 +283,12 @@ export function App() {
           || pageContext.workspaceId !== requestedContext.workspaceId
           || pageContext.conversationId !== requestedContext.conversationId) return;
         setState(normalizeState(nextState));
-        // 结果不确定的默认接收人变更（Dot 0094）：一次成功的状态刷新即
-        // 一次重读，刷新带来的会话状态就是权威值，据此解锁确认中变更。
-        if (defaultAgentChangeTrackerRef.current.resolveConfirming(requestedContext)) {
-          setDefaultAgentChangeRenderTick((tick) => tick + 1);
+        // 结果不确定的默认接收人变更（Dot 0096）：刷新带来的状态可能
+        // 是 PUT 提交前读到的旧值，不得凭一次刷新直接解锁确认中变更；
+        // 刷新只触发一次操作状态确认，由服务端操作记录裁决终结。
+        const confirming = defaultAgentChangeTrackerRef.current.confirmingRequest(requestedContext);
+        if (confirming) {
+          void confirmDefaultAgentOperation(confirming);
         }
       })
       .catch(() => setConnectionState("offline"));
@@ -1012,24 +1014,27 @@ export function App() {
         conversationId: pageContext.conversationId || request.conversationId,
       };
     };
-    // 结果分类（Dot 0094）：只有「成功且带回 conversation」与「4xx 且带
-    // JSON 错误体」是确定结果；网络失败、响应解析失败、5xx 或成功响应
-    // 缺少 conversation 都属于不确定——服务端可能已经提交切换，按确定
-    // 失败解锁回旧值会让界面显示旧接收人而服务器已切换、消息错发。
+    // 结果分类（Dot 0094 + 0096）：只有「成功且带回 conversation、且
+    // 操作状态为 committed」与「4xx 且带 JSON 错误体」是确定结果
+    //（4xx 的可信度由服务端终结屏障背书：变更串行执行、持久化失败
+    // 回滚内存并记 failed）。网络失败、响应解析失败、5xx 或成功响应
+    // 缺少 conversation / 操作状态都属于不确定——服务端可能已经提交
+    // 切换，按确定失败解锁回旧值会让界面显示旧接收人而服务器已切换、
+    // 消息错发。
     let settled = false;
     try {
       const response = await fetch(withPageContext(`/api/conversations/${conversationId}/default-agent`, currentPageContext()), {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ agentId: agentId === "" ? null : agentId }),
+        body: JSON.stringify({ agentId: agentId === "" ? null : agentId, operationId: request.operationId }),
       });
-      let body: { conversation?: ConversationInfo; message?: string } | null = null;
+      let body: { conversation?: ConversationInfo; message?: string; operation?: { status?: string } | null } | null = null;
       try {
-        body = await response.json() as { conversation?: ConversationInfo; message?: string };
+        body = await response.json() as { conversation?: ConversationInfo; message?: string; operation?: { status?: string } | null };
       } catch {
         body = null;
       }
-      if (response.ok && body?.conversation) {
+      if (response.ok && body?.conversation && body.operation?.status === "committed") {
         settled = true;
         if (!tracker.finishChange(request, responseContext())) return;
         setState((current) => ({ ...current, conversation: body.conversation! }));
@@ -1048,28 +1053,97 @@ export function App() {
       setDefaultAgentChangeRenderTick((tick) => tick + 1);
     }
     if (settled) return;
-    // 不确定路径：转入确认中阶段（继续阻断发送），用既有的状态读取路径
-    // 重读该会话，以重读到的会话状态为准解锁——重读值无论与目标一致
-    // 与否都是权威值。有限重试仍失败则保持确认态，等待后续状态刷新
-    // （refreshState 成功时同样解锁），绝不猜测结果、绝不回旧值解锁。
+    // 不确定路径：转入确认中阶段（继续阻断发送），改由操作状态确认
+    // 裁决终结（Dot 0096）：凭 operationId 查服务端操作记录，
+    // committed / failed 才解锁；单次重读不再直接裁决，绝不猜测
+    // 结果、绝不回旧值解锁。
     if (!tracker.markUncertain(request)) return;
     setDefaultAgentChangeRenderTick((tick) => tick + 1);
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 800));
+    await confirmDefaultAgentOperation(request);
+  }
+
+  /**
+   * 确认中变更的操作状态确认（Dot 0096 终结屏障）：凭 operationId 向
+   * 服务端查询该次变更的操作记录，以终结状态裁决解锁，不再以单次
+   * 重读的值裁决（重读可能读到 PUT 提交前的值、PUT 随后才提交）。
+   * - committed：已终结且已提交——再读一次状态把提交后的会话应用到
+   *   界面（该操作已终结，不存在仍在途的同一 PUT，读回即终局状态）；
+   * - failed：已终结且未提交——解锁回旧值并提示失败原因；
+   * - pending：继续等（有限次轮询，间隔 800ms）；
+   * - 记录查不到（operation 为 null）：服务端已重启，在途 PUT 随旧
+   *   进程消亡、不可能再提交——改以状态重读值作为终局权威值解锁
+   *   （resolveWithReread 的唯一适用场景）；
+   * - 轮询预算耗尽仍未终结：保持确认态（发送继续阻断），等后续状态
+   *   刷新再次触发确认，绝不猜测结果。
+   */
+  async function confirmDefaultAgentOperation(request: DefaultAgentChangeRequest): Promise<void> {
+    const tracker = defaultAgentChangeTrackerRef.current;
+    const responseContext = (): { workspaceId: string; conversationId: string } => {
+      const pageContext = readPageContext(window.location.search);
+      return {
+        workspaceId: pageContext.workspaceId,
+        conversationId: pageContext.conversationId || request.conversationId,
+      };
+    };
+    const targetContext = { workspaceId: request.workspaceId, conversationId: request.conversationId };
+    const readState = async (): Promise<AppState | null> => {
       try {
-        const stateResponse = await fetch(withPageContext("/api/state", { workspaceId: request.workspaceId, conversationId: request.conversationId }));
-        if (!stateResponse.ok) continue;
+        const stateResponse = await fetch(withPageContext("/api/state", targetContext));
+        if (!stateResponse.ok) return null;
         const nextState = await stateResponse.json() as AppState;
-        if (nextState.conversation?.id !== request.conversationId) continue;
+        return nextState.conversation?.id === request.conversationId ? nextState : null;
+      } catch {
+        return null;
+      }
+    };
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 800));
+      let operation: { status?: string; message?: string } | null = null;
+      let parsed = false;
+      try {
+        const opResponse = await fetch(withPageContext(
+          `/api/conversations/${request.conversationId}/default-agent-operation?operationId=${encodeURIComponent(request.operationId)}`,
+          targetContext,
+        ));
+        if (opResponse.ok) {
+          const opBody = await opResponse.json() as { operation?: { status?: string; message?: string } | null };
+          if (opBody.operation !== undefined) {
+            operation = opBody.operation;
+            parsed = true;
+          }
+        }
+      } catch {
+        // 查询失败：保持确认态，按有限重试再试。
+      }
+      if (!parsed) continue;
+      if (operation === null) {
+        const nextState = await readState();
+        if (!nextState) continue;
         if (!tracker.resolveWithReread(request, responseContext())) return;
         setState(normalizeState(nextState));
         setDefaultAgentChangeRenderTick((tick) => tick + 1);
         return;
-      } catch {
-        // 重读失败：继续保持确认态，按有限重试再试。
+      }
+      if (operation.status === "pending") continue;
+      if (operation.status === "committed") {
+        const nextState = await readState();
+        if (!nextState) continue;
+        if (!tracker.resolveWithOperation(request, responseContext())) return;
+        setState(normalizeState(nextState));
+        setDefaultAgentChangeRenderTick((tick) => tick + 1);
+        return;
+      }
+      if (operation.status === "failed") {
+        if (!tracker.resolveWithOperation(request, responseContext())) return;
+        setState((current) => ({
+          ...current,
+          messages: [...current.messages, createLocalSystemMessage(operation.message ?? "默认接收员工设置失败")],
+        }));
+        setDefaultAgentChangeRenderTick((tick) => tick + 1);
+        return;
       }
     }
-    // 重读仍未成功：保持确认态阻断发送，明确提示结果未确认。
+    // 轮询预算内未确认：保持确认态阻断发送，明确提示结果未确认。
     if (responseContext().conversationId === request.conversationId) {
       setState((current) => ({ ...current, messages: [...current.messages, createLocalSystemMessage("默认接收员工的设置结果未能确认（可能已保存成功）：发送已暂停，等待状态刷新确认后恢复，请勿按旧接收人继续发送。")] }));
     }

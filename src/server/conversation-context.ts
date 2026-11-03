@@ -51,8 +51,13 @@ export type ConversationContextOptions = {
   /** 监工的运行时与模型偏好（issue #153）。旧字段 supervisionRuntime 由存储层映射而来。 */
   supervisorConfig?: SupervisorConfig;
   lastDirectAgentId?: AgentId;
-  /** 会话记录变更回调（如普通对话目标员工变化），由服务层负责持久化。 */
-  onConversationPatch?: (patch: ConversationContextPatch) => void;
+  /**
+   * 会话记录变更回调（如普通对话目标员工变化），由服务层负责持久化。
+   * 返回 false 表示持久化失败：只有显式设置默认接收人的路径据此回滚
+   * 并报错（setDefaultDirectAgent），其余调用方忽略返回值——持久化
+   * 失败不阻断路由等既有流程的口径不变。返回 void 视为已受理。
+   */
+  onConversationPatch?: (patch: ConversationContextPatch) => boolean | void;
   /** 模型快照桥（issue #142）：读写 workspace 级员工模型状态。 */
   modelState?: AgentModelStateBridge;
 };
@@ -377,8 +382,18 @@ export class ConversationContext {
     }
     const next = agentId ?? undefined;
     if (this._lastDirectAgentId === next) return;
+    const previous = this._lastDirectAgentId;
     this._lastDirectAgentId = next;
-    this.options.onConversationPatch?.({ lastDirectAgentId: agentId });
+    const persisted = this.options.onConversationPatch?.({ lastDirectAgentId: agentId });
+    if (persisted === false) {
+      // 持久化失败（Dot 0096 核查命中的路径）：本方法是先改内存再经
+      // 回调落盘，回调曾把落盘失败静默吞掉——不回滚的话内存是新值、
+      // 磁盘是旧值，错误响应与实际状态脱节，重启后还会悄悄回到旧值。
+      // 回滚内存到原值（磁盘未变，无需再写），让显式设置路径的失败
+      // 重新成为「未提交」的可信信号，并把失败抛给调用方。
+      this._lastDirectAgentId = previous;
+      throw new Error("Failed to persist the default direct agent.");
+    }
   }
 
   private cwd(): string {

@@ -687,7 +687,10 @@ export type AcpSessionRestoreClassification = "recoverable" | "unrecoverable" | 
  * -32603 / "internal error"）不带会话状态细节，单次出现不足以证明原会话
  * 已失效，归为「证据不足」：先在新连接上重试同一绑定；按 Dot 0094 的
  * 收窄，还须证明恢复发生在与创建该会话不同的进程/连接世代，两次同类
- * 拒绝才构成失效实据（见 restoreOrRecoverSession）。识别不了的一律
+ * 拒绝才构成失效实据；且按 Dot 0096 的限定，跨世代实据只对已实测验证
+ * 会话为进程内内存态的 runtime（目前仅 dsh）成立（见
+ * restoreOrRecoverSession 与
+ * SESSION_RESTORE_GENERATION_EVIDENCE_RUNTIMES）。识别不了的一律
  * 返回 null，按普通错误落定，不自动降级。
  */
 export function classifySessionRestoreError(error: unknown): AcpSessionRestoreClassification | null {
@@ -731,6 +734,19 @@ function summarizeRestoreFailure(error: unknown): string {
 }
 
 /**
+ * 跨世代降级的适用范围（Dot 0096）：「创建会话的进程已不存在 ⇒ 进程内
+ * 内存态的旧会话必然无处可寻」这一推理，只对已实测验证其 ACP 会话为
+ * 进程内内存态、跨进程恢复必然被拒的 runtime 成立。目前只有 dsh 有
+ * 这份实证：Orbit 重启后从磁盘恢复绑定、在新进程上 resume 被 dsh 以
+ * -32603 "Internal error" 拒绝，降级新建会话后任务续跑（2026-11-03
+ * 实测）。其他 runtime 可能支持跨进程持久恢复，跨世代加两次泛化内部
+ * 错误对它们不构成会话失效实据：一律保留原绑定、按普通错误落定。
+ * 被明确报告为会话失效（状态冲突/损坏等实据分类）时的降级不受此
+ * 范围限制，任何 runtime 都可按实据降级。
+ */
+const SESSION_RESTORE_GENERATION_EVIDENCE_RUNTIMES: ReadonlySet<AgentRuntimeKind> = new Set(["dsh"]);
+
+/**
  * 恢复既有会话，失败时按分类处理（issue #141；Dot 0092 第 2 项收窄）：
  * - 不可恢复（会话状态冲突或损坏，有明确实据）：直接新建会话降级；
  * - 可恢复（传输断开/超时/进程退出）与证据不足（泛化内部错误）：都先销毁
@@ -740,7 +756,11 @@ function summarizeRestoreFailure(error: unknown): string {
  *   故障）——只有当恢复尝试发生在与创建该会话不同的进程/连接世代
  *   （isCrossGenerationRestore 为 true：创建进程已不存在，进程内内存态
  *   的旧会话必然无处可寻），且同一绑定在新连接上再被同类错误拒绝，
- *   才构成「原会话确已失效」的实据并降级；重试被明确报告为不可恢复
+ *   才构成「原会话确已失效」的实据并降级——且按 Dot 0096 的限定，该
+ *   世代推理仅适用于 SESSION_RESTORE_GENERATION_EVIDENCE_RUNTIMES
+ *   内的 runtime（目前仅 dsh，有跨进程恢复被拒的实测依据）；其他
+ *   runtime 可能支持跨进程持久恢复，跨世代对它们不构成实据，同样按
+ *   普通错误落定、保留原绑定；重试被明确报告为不可恢复
  *   （会话状态冲突/损坏的实据）时同样降级。同世代、或世代不可判定
  *   时一律按普通错误落定，保留原绑定并明确报错，不重绑新会话。
  * 降级新建的会话与全新会话共用同一份 options.prompt（由调用方统一经
@@ -802,10 +822,13 @@ async function restoreOrRecoverSession(
         if (
           retryClassification === "ambiguous"
           && isCrossGenerationRestore(connection, options.resumeSessionId) === true
+          && SESSION_RESTORE_GENERATION_EVIDENCE_RUNTIMES.has(definition.kind)
         ) {
-          // Dot 0094：跨世代 + 两次同类拒绝——创建会话的进程已不存在，
-          // 进程内内存态的旧会话必然失效，构成降级实据。同世代（创建
-          // 进程自己拒绝恢复）或世代不可判定（保守口径）时不降级：
+          // Dot 0094 + 0096：跨世代 + 两次同类拒绝，且该 runtime 的会话
+          // 已实测验证为进程内内存态（目前仅 dsh）——创建会话的进程已
+          // 不存在，旧会话必然失效，构成降级实据。其他 runtime 可能
+          // 支持跨进程持久恢复，跨世代不构成实据；同世代（创建进程
+          // 自己拒绝恢复）或世代不可判定（保守口径）时同样不降级：
           // 落入下方普通错误，保留原绑定并明确报错。
           return downgradeToFreshSession(replacement, options, definition, absoluteCwd, retryError);
         }

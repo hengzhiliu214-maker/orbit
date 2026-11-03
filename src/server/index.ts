@@ -34,6 +34,7 @@ import { buildAttachmentHeaders } from "./attachment-response.ts";
 import { canSendMessage } from "../shared/message-validation.ts";
 import { resolveSlashSendTarget } from "../core/native-commands.ts";
 import { ConversationContext } from "./conversation-context.ts";
+import { DefaultAgentOperationRegistry } from "./default-agent-operations.ts";
 import { probeAgentCommands } from "./command-probe.ts";
 import { findPortOwners, isOrbitPortOwner, stopPortOwner } from "./port-recovery.ts";
 import { readJson, RequestBodyTooLargeError } from "./read-json.ts";
@@ -78,6 +79,8 @@ const execFileAsync = promisify(execFile);
 // --- Shared singletons ---
 const eventBus = new EventBus();
 const sseHub = new SseHub();
+/** 默认接收人变更的操作登记（Dot 0096 终结屏障）：按会话串行并记录终结状态。 */
+const defaultAgentOperations = new DefaultAgentOperationRegistry();
 const workspaceStore = new WorkspaceStore();
 const configStore = new AgentConfigStore();
 const agentModelStateStore = new AgentModelStateStore();
@@ -532,8 +535,13 @@ function createContext(workspaceId: string, conversationId: string): Conversatio
         if (workspaceId === activeWorkspaceId && conversationId === activeConversationId) {
           activeConversation = toActiveConversation(updated);
         }
+        return true;
       } catch {
-        // 持久化失败不阻断路由流程；模式仍在本会话上下文中生效
+        // 持久化失败不阻断路由流程；模式仍在本会话上下文中生效。
+        // 返回 false 供显式设置默认接收人的路径回滚内存并报错（Dot
+        // 0096：此前静默吞掉落盘失败，会让内存已改、磁盘未改而响应
+        // 仍报成功）；其余调用方忽略返回值，行为不变。
+        return false;
       }
     },
   });
@@ -1642,6 +1650,13 @@ const server = http.createServer(async (req, res) => {
 
     // 默认接收员工（Dot 0076）：普通对话模式下无 @ 消息的固定收件人。
     // 只改会话记录，不发送任何消息；agentId 必须是本工作区员工，null 为清除。
+    // 终结屏障（Dot 0096）：客户端每次变更带唯一 operationId，服务端按
+    // 会话串行执行（DefaultAgentOperationRegistry.runExclusive），并把该
+    // 操作登记为 pending → committed / failed。committed 的判据是落盘后
+    // 读回的持久值与目标一致；持久化失败时上下文回滚内存状态并抛错
+    // （见 ConversationContext.setDefaultDirectAgent），因此错误响应
+    // 重新成为「未提交」的可信信号。客户端在 PUT 结果不确定时凭操作号
+    // 查操作状态裁决终结，不再以单次重读的值解锁。
     if (req.method === "PUT" && url.pathname.startsWith("/api/conversations/") && url.pathname.endsWith("/default-agent")) {
       const parts = url.pathname.split("/");
       const convId = parts[3];
@@ -1651,22 +1666,69 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 409, { ok: false, message: "workspaceId and conversationId are required." });
         return;
       }
-      const input = (await readJson(req)) as { agentId?: unknown };
+      const input = (await readJson(req)) as { agentId?: unknown; operationId?: unknown };
       if (input.agentId !== null && typeof input.agentId !== "string") {
         sendJson(res, 400, { ok: false, message: "agentId (string or null) is required." });
         return;
       }
       const ctx = contextForTarget(target);
       if (!ctx) { sendJson(res, 409, { ok: false, message: "No active conversation context." }); return; }
-      try {
-        const current = conversationStoreFor(target.workspaceId).get(target.workspaceId, convId);
-        if (!current) throw new Error("Conversation not found.");
-        ctx.setDefaultDirectAgent(input.agentId as AgentId | null);
-        const updated = conversationStoreFor(target.workspaceId).get(target.workspaceId, convId) ?? current;
-        sendJson(res, 200, { ok: true, conversation: updated });
-      } catch (error) {
-        sendJson(res, 409, { ok: false, message: error instanceof Error ? error.message : String(error) });
+      const agentId = input.agentId as AgentId | null;
+      const operationId = typeof input.operationId === "string" && input.operationId.length > 0
+        ? input.operationId
+        : null;
+      const operationKey = `${target.workspaceId}\n${convId}`;
+      await defaultAgentOperations.runExclusive(operationKey, async () => {
+        if (operationId) defaultAgentOperations.begin(operationKey, operationId, agentId);
+        try {
+          const current = conversationStoreFor(target.workspaceId).get(target.workspaceId, convId);
+          if (!current) throw new Error("Conversation not found.");
+          ctx.setDefaultDirectAgent(agentId);
+          const updated = conversationStoreFor(target.workspaceId).get(target.workspaceId, convId) ?? current;
+          if ((updated.lastDirectAgentId ?? null) !== agentId) {
+            // 读回的持久值与目标不一致：不得把这次变更报成已提交。
+            // 内存以读回的持久值为准对齐（其落盘值即当前磁盘值），
+            // 操作记为失败，客户端按未提交处理。
+            try {
+              ctx.setDefaultDirectAgent(updated.lastDirectAgentId ?? null);
+            } catch {
+              // 读回值对应的员工已不存在时保持内存现状，仍按失败上报。
+            }
+            throw new Error("Failed to persist the default direct agent.");
+          }
+          const operation = operationId
+            ? defaultAgentOperations.commit(operationKey, operationId, agentId)
+            : undefined;
+          sendJson(res, 200, { ok: true, conversation: updated, ...(operation ? { operation } : {}) });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const operation = operationId
+            ? defaultAgentOperations.fail(operationKey, operationId, message)
+            : undefined;
+          sendJson(res, 409, { ok: false, message, ...(operation ? { operation } : {}) });
+        }
+      });
+      return;
+    }
+
+    // 默认接收人变更的操作状态查询（Dot 0096 终结屏障）：客户端在 PUT
+    // 结果不确定时凭 operationId 查询该次变更是否已终结。查不到记录
+    //（服务端重启后操作表为空）返回 operation: null——重启后不存在
+    // 仍在途的 PUT，客户端可改以状态重读值作为终局权威值。
+    if (req.method === "GET" && url.pathname.startsWith("/api/conversations/") && url.pathname.endsWith("/default-agent-operation")) {
+      const parts = url.pathname.split("/");
+      const convId = parts[3];
+      if (!convId) { sendJson(res, 400, { ok: false, message: "Missing conversation id." }); return; }
+      const target = resolveTarget(url);
+      if (!target || target.conversationId !== convId) {
+        sendJson(res, 409, { ok: false, message: "workspaceId and conversationId are required." });
+        return;
       }
+      const operationId = url.searchParams.get("operationId");
+      const operation = operationId
+        ? defaultAgentOperations.get(`${target.workspaceId}\n${convId}`, operationId)
+        : undefined;
+      sendJson(res, 200, { ok: true, operation: operation ?? null });
       return;
     }
 
@@ -2209,7 +2271,7 @@ async function handlePutAgents(req: http.IncomingMessage, res: http.ServerRespon
   if (staleOverwrite) {
     sendJson(res, 409, {
       ok: false,
-      message: `员工「${staleOverwrite.agentName}」的${staleOverwrite.field === "model" ? "模型" : "思考强度"}偏好已拒绝保存：提交的值与一份较早的会话记录相同，可能来自过期的模型列表，保存会覆盖较新的偏好。解开方法：关闭设置面板且不要保存，重新打开后把该员工的${staleOverwrite.field === "model" ? "模型" : "思考强度"}改回标注「已保存的首选」的那一项（重新打开时已保存偏好即为选中项）再保存，或改选一个不等于该旧记录值的新偏好。注意：点「刷新模型列表」只会更新可选列表，不会自动把已修改的选择改回已保存偏好。本拦截只针对这一种过期值覆盖（特定签名），并非通用的并发保存保护。`,
+      message: `员工「${staleOverwrite.agentName}」的${staleOverwrite.field === "model" ? "模型" : "思考强度"}偏好已拒绝保存：提交的值与一份较早的会话记录相同，可能来自过期的模型列表，保存会覆盖较新的偏好。解开方法：关闭设置面板且不要保存，重新打开设置面板后直接保存（重新打开时当前选中项即已保存的偏好，未保存的更改会丢失）；或改选一个不等于该旧记录值的新偏好。注意：点「刷新模型列表」只会更新可选列表，不会自动把已修改的选择改回已保存偏好。本拦截只针对这一种过期值覆盖（特定签名），并非通用的并发保存保护。`,
     });
     return;
   }

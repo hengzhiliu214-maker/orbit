@@ -21,6 +21,17 @@
  * （resolveWithReread）；重读也失败则保持确认态，等待后续状态刷新
  * 带来的新状态再解锁（resolveConfirming）。只有收到明确的错误响应
  * （如 4xx 带 JSON 错误体）才算确定失败，走 finishChange 立即解锁。
+ *
+ * Dot 0096 终结屏障：在此基础上再进一步——单次重读不是原 PUT 已终结
+ * 的屏障（重读可能读到 PUT 提交前的值、PUT 随后才提交）。每次变更
+ * 因此携带唯一 operationId，服务端按操作登记 pending/committed/
+ * failed 并串行执行；确认阶段的裁决依据改为操作状态（终结才解锁，
+ * resolveWithOperation），不再以读回值本身裁决。resolveWithReread
+ * 收窄为唯一回退场景：操作记录查不到（服务端已重启——在途 PUT 随
+ * 旧进程消亡，不可能再提交），此时重读值才是终局权威值。App 的状态
+ * 刷新路径也不再凭一次刷新直接解锁（刷新可能带着 PUT 前读到的旧
+ * 值），只触发一次操作状态确认；resolveConfirming 保留为跟踪器原语
+ * （其单测覆盖语义），App 不再直接调用它解锁。
  */
 
 export type DefaultAgentChangeContext = {
@@ -31,6 +42,11 @@ export type DefaultAgentChangeContext = {
 export type DefaultAgentChangeRequest = DefaultAgentChangeContext & {
   /** 变更序号（单调递增）；响应到达时凭此确认仍是该会话的在途变更。 */
   sequence: number;
+  /**
+   * 客户端操作号（Dot 0096）：随 PUT 发给服务端登记操作状态；结果
+   * 不确定时凭此查询该次变更是否已终结（committed / failed）。
+   */
+  operationId: string;
 };
 
 /** 在途变更的阶段：等待 PUT 结果，或结果不确定、等待重读确认。 */
@@ -53,11 +69,18 @@ export function createDefaultAgentChangeTracker() {
     /**
      * 开始一次变更并占用该会话的在途槽位；同一会话已有在途变更时
      * 返回 null（序列化：先等在途变更确认，再接受下一次变更）。
+     * operationId 缺省由跟踪器生成（序号 + 时间 + 随机后缀，页面生命
+     * 周期内唯一）；测试可传入固定值。
      */
-    beginChange(context: DefaultAgentChangeContext): DefaultAgentChangeRequest | null {
+    beginChange(context: DefaultAgentChangeContext, operationId?: string): DefaultAgentChangeRequest | null {
       const key = keyOf(context);
       if (pendingByConversation.has(key)) return null;
-      const request: DefaultAgentChangeRequest = { ...context, sequence: ++sequence };
+      const request: DefaultAgentChangeRequest = {
+        ...context,
+        sequence: ++sequence,
+        operationId: operationId
+          ?? `op-${sequence.toString(36)}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      };
       pendingByConversation.set(key, { request, phase: "awaiting" });
       return request;
     },
@@ -103,10 +126,36 @@ export function createDefaultAgentChangeTracker() {
       return true;
     },
     /**
+     * 该会话处于确认中阶段的在途变更（Dot 0096）：状态刷新等外部触发
+     * 凭此找到需要做操作状态确认的变更，而不是凭刷新直接解锁。
+     * 不在确认中（无在途变更、或仍在等 PUT 结果）时返回 null。
+     */
+    confirmingRequest(context: DefaultAgentChangeContext): DefaultAgentChangeRequest | null {
+      const pending = pendingByConversation.get(keyOf(context));
+      return pending && pending.phase === "confirming" ? pending.request : null;
+    },
+    /**
+     * 操作状态已终结（Dot 0096：服务端操作记录 committed 或 failed）
+     * 时解锁确认中变更：结束在途变更，返回值判定该终结结果是否仍可
+     * 应用到界面（同 finishChange 的过期规则）。提交值或失败原因由
+     * 调用方按操作记录应用。只有确认中阶段的变更可经此解锁。
+     */
+    resolveWithOperation(request: DefaultAgentChangeRequest, currentContext: DefaultAgentChangeContext): boolean {
+      const key = keyOf(request);
+      const pending = pendingByConversation.get(key);
+      if (!pending || pending.request.sequence !== request.sequence || pending.phase !== "confirming") return false;
+      pendingByConversation.delete(key);
+      return currentContext.workspaceId === request.workspaceId
+        && currentContext.conversationId === request.conversationId;
+    },
+    /**
      * 以重读到的服务端状态为准解锁确认中变更：结束在途变更，返回值
      * 判定重读结果是否仍可应用到界面（同 finishChange 的过期规则）。
      * 只有确认中阶段的变更可经此解锁；重读值本身由调用方应用，本函数
      * 不猜测目标值是否达成——重读值即权威值，无论与目标一致与否都解锁。
+     * Dot 0096 后本路径只用于操作记录查不到的回退场景（服务端重启，
+     * 在途 PUT 已随旧进程消亡，重读值才是终局权威值）；操作记录还在
+     * 时必须走 resolveWithOperation 以操作终结状态裁决。
      */
     resolveWithReread(request: DefaultAgentChangeRequest, currentContext: DefaultAgentChangeContext): boolean {
       const key = keyOf(request);
@@ -118,7 +167,10 @@ export function createDefaultAgentChangeTracker() {
     },
     /**
      * 后续状态刷新已带来该会话的新状态（刷新本身即一次重读）时，解锁
-     * 其确认中变更。返回是否确有确认中变更被解锁。
+     * 其确认中变更。返回是否确有确认中变更被解锁。Dot 0096 后 App 的
+     * 刷新路径不再直接调用本函数解锁（刷新可能带着 PUT 提交前读到的
+     * 旧值，凭它解锁会重演单次重读的乱序问题），改为经
+     * confirmingRequest 触发操作状态确认；本函数保留为跟踪器原语。
      */
     resolveConfirming(context: DefaultAgentChangeContext): boolean {
       const key = keyOf(context);

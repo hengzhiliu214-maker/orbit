@@ -169,6 +169,52 @@ describe("default agent change tracker: uncertain outcomes (Dot 0094)", () => {
   });
 });
 
+describe("default agent change tracker: operation barrier (Dot 0096)", () => {
+  test("each change carries a unique client operation id for the server barrier", () => {
+    const tracker = createDefaultAgentChangeTracker();
+    const first = tracker.beginChange(CONV_A)!;
+    assert.ok(first.operationId.length > 0, "change must carry an operation id");
+    assert.equal(tracker.finishChange(first, CONV_A), true);
+    const second = tracker.beginChange(CONV_A)!;
+    assert.notEqual(second.operationId, first.operationId, "operation ids must be unique per change");
+    // 测试可显式指定操作号。
+    assert.equal(tracker.finishChange(second, CONV_A), true);
+    const pinned = tracker.beginChange(CONV_A, "op-pinned")!;
+    assert.equal(pinned.operationId, "op-pinned");
+  });
+
+  test("operation resolution unlocks only from the confirming phase", () => {
+    const tracker = createDefaultAgentChangeTracker();
+    const request = tracker.beginChange(CONV_A)!;
+    // 尚未转入确认中：不得用操作状态解锁（确定结果走 finishChange）。
+    assert.equal(tracker.resolveWithOperation(request, CONV_A), false);
+    assert.equal(tracker.isChangePending(CONV_A), true);
+    assert.equal(tracker.markUncertain(request), true);
+    // 操作终结（committed / failed 都经此解锁）：槽位释放，发送恢复。
+    assert.equal(tracker.resolveWithOperation(request, CONV_A), true);
+    assert.equal(tracker.isChangeConfirming(CONV_A), false);
+    assert.equal(tracker.canSend(CONV_A), true);
+  });
+
+  test("confirmingRequest exposes the live confirming change for refresh-triggered confirmation", () => {
+    const tracker = createDefaultAgentChangeTracker();
+    assert.equal(tracker.confirmingRequest(CONV_A), null, "no change in flight: nothing to confirm");
+    const request = tracker.beginChange(CONV_A)!;
+    assert.equal(tracker.confirmingRequest(CONV_A), null, "awaiting the PUT result is not confirming yet");
+    assert.equal(tracker.markUncertain(request), true);
+    assert.equal(tracker.confirmingRequest(CONV_A)?.operationId, request.operationId);
+    assert.equal(tracker.confirmingRequest(CONV_B), null, "another conversation has no confirming change");
+    // 过期请求的操作解锁不得影响该确认中变更。
+    const stale = { ...request, sequence: request.sequence + 99 };
+    assert.equal(tracker.resolveWithOperation(stale, CONV_A), false);
+    assert.equal(tracker.isChangeConfirming(CONV_A), true);
+    // 已切换会话时操作终结结果不得回写新会话，但仍释放槽位。
+    assert.equal(tracker.resolveWithOperation(request, CONV_B), false);
+    assert.equal(tracker.isChangePending(CONV_A), false);
+    assert.equal(tracker.confirmingRequest(CONV_A), null);
+  });
+});
+
 describe("App wiring for default agent change races", () => {
   test("updateDefaultDirectAgent is bound to the tracker lifecycle", () => {
     const updateMatch = appSource.match(/async function updateDefaultDirectAgent\([\s\S]*?\n  \}/);
@@ -183,15 +229,24 @@ describe("App wiring for default agent change races", () => {
     assert.match(sendMatch[0], /defaultAgentChangeTrackerRef\.current\.canSend\(/);
   });
 
-  test("uncertain outcomes go through the confirming phase and the state reread path (Dot 0094)", () => {
+  test("uncertain outcomes are settled by the server operation barrier, not a single reread (Dot 0096)", () => {
     const updateMatch = appSource.match(/async function updateDefaultDirectAgent\([\s\S]*?\n  \}/);
     assert.ok(updateMatch, "updateDefaultDirectAgent must exist");
     assert.match(updateMatch[0], /tracker\.markUncertain\(request\)/);
-    assert.match(updateMatch[0], /tracker\.resolveWithReread\(request, responseContext\(\)\)/);
-    assert.match(updateMatch[0], /"\/api\/state"/, "确认必须走既有的状态读取路径重读");
+    assert.match(updateMatch[0], /operationId: request\.operationId/, "PUT 必须带客户端操作号登记服务端操作状态");
+    const confirmMatch = appSource.match(/async function confirmDefaultAgentOperation\([\s\S]*?\n  \}/);
+    assert.ok(confirmMatch, "confirmDefaultAgentOperation must exist");
+    assert.match(confirmMatch[0], /default-agent-operation/, "确认必须查询服务端操作状态（终结屏障）");
+    assert.match(confirmMatch[0], /tracker\.resolveWithOperation\(request, responseContext\(\)\)/, "操作终结（committed/failed）才可解锁");
+    // 操作记录查不到（服务端重启）时才回退到状态重读裁决。
+    assert.match(confirmMatch[0], /tracker\.resolveWithReread\(request, responseContext\(\)\)/);
+    assert.match(confirmMatch[0], /"\/api\/state"/, "终结后应用状态仍走既有的状态读取路径");
     assert.match(appSource, /确认中…/);
     assert.match(appSource, /接收人结果确认中，完成后可发送/);
-    assert.match(appSource, /resolveConfirming\(requestedContext\)/, "状态刷新成功也要能解锁确认中变更");
+    // 状态刷新不再凭一次刷新直接解锁（可能带着 PUT 前读到的旧值），
+    // 只触发操作状态确认。
+    assert.match(appSource, /confirmingRequest\(requestedContext\)/, "状态刷新须触发操作状态确认");
+    assert.ok(!appSource.includes("resolveConfirming(requestedContext)"), "状态刷新不得再凭刷新本身解锁确认中变更");
   });
 
   test("composer disables the picker and the send button while pending, with a visible status", () => {

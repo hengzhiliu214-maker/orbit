@@ -554,7 +554,9 @@ test("stdout EOF rejects pending ACP requests and marks the connection dead", { 
 
 test("an unrecoverable resume failure falls back to a fresh session", async () => {
   // Issue #141：thread-store conflict / active writer 表明原会话状态已不可
-  // 用，必须在同一条连接上直接新建会话，sessionId 落定新值。降级提示必须
+  // 用，必须在同一条连接上直接新建会话，sessionId 落定新值。Dot 0096：
+  // 明确失效实据的降级不受 runtime 适用范围限制——本用例的定义是
+  // codebuddy（不在跨世代实据名单内），凭实据仍须降级。降级提示必须
   // 走过程叙述流（process.text）在持久时间线留痕，而不是只走 onOutput。
   const notices: string[] = [];
   const fake = fakeConnector({
@@ -621,6 +623,14 @@ test("an opaque internal error rejected on both connections downgrades with a pe
   // 且必须如实说明历史可能被截断、不保证上下文完整，不得再声称「仅运
   // 行时内部状态重置」。新会话收到的 prompt 与全新会话完全相同（同一
   // 份 options.prompt）。
+  // Dot 0096：跨世代实据只对已实测验证会话为进程内内存态的 runtime
+  // 成立，目前仅 dsh——本用例建模的正是 dsh 的实测场景，故用 dsh 定义；
+  // 未验证的 runtime 见下一用例（同形输入不得降级）。
+  const dshDefinition: AcpRuntimeDefinition = {
+    kind: "dsh",
+    displayName: "Fake DSH",
+    buildCommand: () => ({ file: "fake-acp", args: [] }),
+  };
   const notices: string[] = [];
   const fake = fakeConnector({
     resumeCapability: true,
@@ -633,7 +643,7 @@ test("an opaque internal error rejected on both connections downgrades with a pe
       resumeSessionId: "old-session",
       onActivity: (activity: AgentActivityEvent) => { if (activity.type === "process.text") notices.push(activity.text); },
     }),
-    definition,
+    dshDefinition,
     fake.connector,
   );
 
@@ -649,6 +659,31 @@ test("an opaque internal error rejected on both connections downgrades with a pe
   assert.ok(notices.some((text) => text.includes("Internal error")), `expected failure summary in: ${notices.join(" | ")}`);
   assert.ok(notices.some((text) => text.includes("不保证上下文完整")), `expected honest history caveat in: ${notices.join(" | ")}`);
   assert.ok(!notices.some((text) => text.includes("仅运行时内部状态重置")), "旧文案不得再承诺上下文完整");
+});
+
+test("cross-generation double internal errors do not downgrade for runtimes without verified in-memory sessions (Dot 0096)", async () => {
+  // 与上一用例同形的跨世代（来源世代查不到）+ 两条连接同类拒绝，但
+  // runtime 是 codebuddy：它的会话是否为进程内内存态没有实测验证，
+  // 可能支持跨进程持久恢复，跨世代不能普遍证明会话不可恢复。必须
+  // 保留原绑定、本轮按普通失败落定，不因世代变化自动新建会话。
+  const fake = fakeConnector({
+    resumeCapability: true,
+    resumeError: Object.assign(new Error("Internal error"), { code: -32603 }),
+    secondResumeError: Object.assign(new Error("Internal error"), { code: -32603 }),
+  });
+  const handle = runAcp(
+    runOptions({ resumeSessionId: "old-session" }),
+    definition,
+    fake.connector,
+  );
+
+  await assert.rejects(handle.result, (error: unknown) => {
+    assert.match((error as Error).message, /Internal error/);
+    return true;
+  });
+  assert.equal(fake.spawnCount, 2, "仍只允许换连接重试一次");
+  assert.ok(fake.calls.includes("session/resume:2:old-session"), "降级与否不影响先重试同一绑定");
+  assert.ok(!fake.calls.some((call) => call.startsWith("session/new:")), "未验证 runtime 跨世代双 -32603 不得降级新建会话");
 });
 
 test("same-generation double internal errors do not downgrade (Dot 0094)", async () => {

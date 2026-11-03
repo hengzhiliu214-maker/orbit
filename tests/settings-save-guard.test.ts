@@ -104,7 +104,7 @@ test("保存防护：切换运行时的保存不按旧快照判断", () => {
   assert.equal(findStaleSnapshotPreferenceOverwrite(stored, [switched], { verification: dshSnapshot() }), undefined);
 });
 
-test("409 文案（Dot 0094）：不承诺刷新自动重置，给出经验证的恢复步骤，并保留特定签名口径", () => {
+test("409 文案（Dot 0094 + 0096）：不承诺刷新自动重置，给出经验证的恢复步骤，并保留特定签名口径", () => {
   const serverSource = fs.readFileSync(
     path.resolve(import.meta.dirname, "../src/server/index.ts"),
     "utf-8",
@@ -116,9 +116,14 @@ test("409 文案（Dot 0094）：不承诺刷新自动重置，给出经验证�
   // 旧误导口径（刷新会以已保存偏好为选中项提交）不得再出现。
   assert.ok(!serverSource.includes("并以已保存偏好为选中项提交"), "409 文案不得再暗示刷新会以已保存偏好提交");
   assert.ok(!guardSource.includes("并作为选中"), "守卫注释不得再暗示刷新会以已保存偏好提交");
-  // 经代码验证的恢复步骤：关面板不保存、重开后改回标注「已保存的首选」项。
+  // Dot 0096：「已保存的首选」标签只在选项不在探针列表时才出现，409
+  // 文案不得再让用户去「改回标注已保存的首选的那一项」。
+  assert.ok(!serverSource.includes("改回标注「已保存的首选」"), "409 文案不得再以缺项时才出现的标签指引恢复步骤");
+  // 经代码验证的恢复步骤：关面板不保存、重开后当前选中项即已保存
+  // 偏好、未保存的更改会丢失，直接保存即可。
   assert.ok(serverSource.includes("关闭设置面板且不要保存"), "409 文案须给出关面板重开的恢复步骤");
-  assert.ok(serverSource.includes("已保存的首选"), "409 文案须指向标注「已保存的首选」的选项");
+  assert.ok(serverSource.includes("当前选中项即已保存的偏好"), "409 文案须写明重开后当前选中项即已保存偏好");
+  assert.ok(serverSource.includes("未保存的更改会丢失"), "409 文案须标明未保存更改会丢失");
   assert.ok(serverSource.includes("不会自动把已修改的选择改回已保存偏好"), "409 文案须明确刷新不自动重置");
   assert.ok(serverSource.includes("特定签名"), "409 文案须保留守卫只拦特定签名的口径");
   assert.ok(guardSource.includes("mergeProbedConfigs"), "守卫注释须记录刷新保留未保存选择的机制依据");
