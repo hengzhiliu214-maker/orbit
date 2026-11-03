@@ -13,10 +13,12 @@ import type {
 
 import {
   CANCEL_GRACE_MS,
+  legacyModelStateOf,
   probeAcpCommands,
   probeAcpModelState,
   runAcp,
   spawnAcpConnection,
+  toModelSnapshot,
   type AcpConnection,
   type AcpConnector,
   type AcpRuntimeDefinition,
@@ -52,6 +54,10 @@ type FakeConnectionControls = {
   capabilities?: AgentCapabilities;
   /** issue #160：让 newSession 挂起，模拟 session/new 响应前的创建窗口。 */
   hangNewSession?: boolean;
+  /** B：session/new 响应携带的 legacy models 状态（Codex 变体）。 */
+  sessionModels?: unknown;
+  setModelError?: Error;
+  omitSetModel?: boolean;
 };
 
 function fakeConnector(controls: FakeConnectionControls = {}) {
@@ -93,6 +99,7 @@ function fakeConnector(controls: FakeConnectionControls = {}) {
         return {
           sessionId: connectionSpawn === 1 ? "fake-session" : `fake-session-${connectionSpawn}`,
           ...(controls.sessionConfigOptions ? { configOptions: controls.sessionConfigOptions } : {}),
+          ...(controls.sessionModels ? { models: controls.sessionModels } : {}),
         };
       },
       async loadSession(request) {
@@ -114,6 +121,10 @@ function fakeConnector(controls: FakeConnectionControls = {}) {
         if (controls.setConfigOptionPending) return new Promise<SetSessionConfigOptionResponse>(() => {});
         const configOptions = controls.setConfigOptionConfigOptions ?? controls.sessionConfigOptions ?? [];
         return { configOptions } satisfies SetSessionConfigOptionResponse;
+      },
+      async setModel(request) {
+        calls.push(`session/set_model:${request.sessionId}:${request.modelId}`);
+        if (controls.setModelError) throw controls.setModelError;
       },
       prompt(request: { sessionId: string; prompt?: unknown }) {
         calls.push(`session/prompt:${request.sessionId}`);
@@ -144,6 +155,7 @@ function fakeConnector(controls: FakeConnectionControls = {}) {
         calls.push(`destroy:${connectionSpawn}`);
       },
     };
+    if (controls.omitSetModel) delete connection.setModel;
     return connection;
   };
   return {
@@ -530,8 +542,9 @@ test("stdout EOF rejects pending ACP requests and marks the connection dead", { 
 
 test("an unrecoverable resume failure falls back to a fresh session", async () => {
   // Issue #141：thread-store conflict / active writer 表明原会话状态已不可
-  // 用，必须在同一条连接上直接新建会话，sessionId 落定新值并输出过程提示。
-  const output: string[] = [];
+  // 用，必须在同一条连接上直接新建会话，sessionId 落定新值。降级提示必须
+  // 走过程叙述流（process.text）在持久时间线留痕，而不是只走 onOutput。
+  const notices: string[] = [];
   const fake = fakeConnector({
     resumeCapability: true,
     answerText: "答复文本",
@@ -540,7 +553,7 @@ test("an unrecoverable resume failure falls back to a fresh session", async () =
   const handle = runAcp(
     runOptions({
       resumeSessionId: "old-session",
-      onOutput: (text: string) => output.push(text),
+      onActivity: (activity: AgentActivityEvent) => { if (activity.type === "process.text") notices.push(activity.text); },
     }),
     definition,
     fake.connector,
@@ -553,8 +566,94 @@ test("an unrecoverable resume failure falls back to a fresh session", async () =
   assert.ok(fake.calls.includes("session/new:1"), "不可恢复失败必须新建会话");
   assert.ok(fake.calls.includes("session/prompt:fake-session"), "新建会话后 prompt 必须使用新 id");
   assert.equal(fake.spawnCount, 1, "不可恢复降级不换连接");
-  assert.ok(output.some((text) => text.includes("已使用新的会话继续")), `expected downgrade notice in: ${output.join(" | ")}`);
-  assert.ok(output.some((text) => text.includes("thread-store conflict")), `expected failure summary in: ${output.join(" | ")}`);
+  assert.ok(notices.some((text) => text.includes("已重建新会话")), `expected persisted downgrade notice in: ${notices.join(" | ")}`);
+  assert.ok(notices.some((text) => text.includes("thread-store conflict")), `expected failure summary in: ${notices.join(" | ")}`);
+});
+
+test("an opaque internal-error resume failure retries the same session on a fresh connection", async () => {
+  // Dot 0092 第 2 项收窄：泛化内部错误（实测 dsh 跨进程 resume 返回 -32603
+  // "Internal error"）单次出现不足以证明会话失效——先销毁当前连接、用
+  // 同一个 sessionId 在新连接上重试；重试成功即恢复原会话，不降级。
+  const output: string[] = [];
+  const fake = fakeConnector({
+    resumeCapability: true,
+    answerText: "答复文本",
+    resumeError: Object.assign(new Error("Internal error"), { code: -32603 }),
+  });
+  const handle = runAcp(
+    runOptions({
+      resumeSessionId: "old-session",
+      onOutput: (text: string) => output.push(text),
+    }),
+    definition,
+    fake.connector,
+  );
+
+  const answer = await handle.result;
+  assert.equal(answer, "答复文本");
+  assert.equal(await handle.sessionId, "old-session", "重试成功必须保留原 sessionId，不得降级");
+  assert.equal(fake.spawnCount, 2, "证据不足时必须先换连接重试同一绑定");
+  assert.ok(fake.calls.includes("destroy:1"), "旧 lease 必须先销毁");
+  assert.ok(fake.calls.includes("session/resume:2:old-session"), "重试必须在新连接上用同一个 sessionId resume");
+  assert.ok(fake.calls.includes("session/prompt:old-session"));
+  assert.ok(!fake.calls.some((call) => call.startsWith("session/new:")), "单次泛化错误不得新建会话");
+  assert.ok(output.some((text) => text.includes("已在新连接上恢复原会话")), `expected retry notice in: ${output.join(" | ")}`);
+});
+
+test("an opaque internal error rejected on both connections downgrades with a persisted notice", async () => {
+  // 同一绑定在两条连接上被同类错误接连拒绝，才构成「原会话确已失效」的
+  // 实据（含 2026-11-03 实测的 dsh 跨进程场景：每个新进程都不认识旧会话，
+  // 必然连续拒绝）——此时按不可恢复降级新建会话，且提示必须走过程叙述
+  // 流在持久时间线留痕。新会话收到的 prompt 与全新会话完全相同（同一份
+  // options.prompt），上下文组装不因降级而缺失。
+  const notices: string[] = [];
+  const fake = fakeConnector({
+    resumeCapability: true,
+    answerText: "答复文本",
+    resumeError: Object.assign(new Error("Internal error"), { code: -32603 }),
+    secondResumeError: Object.assign(new Error("Internal error"), { code: -32603 }),
+  });
+  const handle = runAcp(
+    runOptions({
+      resumeSessionId: "old-session",
+      onActivity: (activity: AgentActivityEvent) => { if (activity.type === "process.text") notices.push(activity.text); },
+    }),
+    definition,
+    fake.connector,
+  );
+
+  const answer = await handle.result;
+  assert.equal(answer, "答复文本");
+  assert.equal(await handle.sessionId, "fake-session-2", "两次拒绝后降级，sessionId 落定新连接上的新会话");
+  assert.equal(fake.spawnCount, 2, "降级发生在重试的新连接上，不再另换连接");
+  assert.ok(fake.calls.includes("session/resume:2:old-session"), "降级前必须先在新连接上重试同一绑定");
+  assert.ok(fake.calls.includes("session/new:2"), "两次同类拒绝后必须新建会话");
+  assert.ok(fake.calls.includes("session/prompt:fake-session-2"), "新建会话后 prompt 必须使用新 id");
+  assert.deepEqual(fake.prompts.length, 1, "降级后只发送本轮同一份 prompt");
+  assert.ok(notices.some((text) => text.includes("已重建新会话")), `expected persisted downgrade notice in: ${notices.join(" | ")}`);
+  assert.ok(notices.some((text) => text.includes("Internal error")), `expected failure summary in: ${notices.join(" | ")}`);
+});
+
+test("an opaque internal error followed by an unrelated retry failure settles as a normal error", async () => {
+  // 证据不足 + 重试以其他方式（传输中断）失败：不构成会话失效实据，
+  // 按普通错误落定，不新建会话、不改绑定，留待主人下一条消息决定。
+  const fake = fakeConnector({
+    resumeCapability: true,
+    resumeError: Object.assign(new Error("Internal error"), { code: -32603 }),
+    secondResumeError: new Error("Fake Agent ACP transport closed (stdout ended while pid 2 was still running)."),
+  });
+  const handle = runAcp(
+    runOptions({ resumeSessionId: "old-session" }),
+    definition,
+    fake.connector,
+  );
+
+  await assert.rejects(handle.result, (error: unknown) => {
+    assert.match((error as Error).message, /transport closed/);
+    return true;
+  });
+  assert.equal(fake.spawnCount, 2, "只允许重试一次");
+  assert.ok(!fake.calls.some((call) => call.startsWith("session/new:")), "证据不足时不得降级新建会话");
 });
 
 test("a recoverable resume failure retries the same session id on a fresh connection", async () => {
@@ -684,6 +783,355 @@ test("probes model options without prompting and destroys the temporary connecti
   assert.equal(snapshot?.currentValueSource, "probe");
   assert.equal(fake.calls.some((call) => call.startsWith("session/prompt:")), false);
   assert.ok(fake.calls.some((call) => call.startsWith("destroy:")));
+});
+
+// ---- 思考强度：标准配置项（CodeBuddy thought_level / dsh reasoning_effort） ----
+
+function thoughtLevelOption(overrides: {
+  currentValue?: string;
+  options?: SessionConfigSelectOptions;
+  category?: string;
+} = {}): SessionConfigOption {
+  return {
+    id: "thought_level",
+    name: "Thought Level",
+    type: "select",
+    category: overrides.category ?? "thought_level",
+    currentValue: overrides.currentValue ?? "enabled",
+    options: overrides.options ?? [
+      { value: "enabled", name: "Enabled" },
+      { value: "high", name: "High" },
+    ],
+  };
+}
+
+function reasoningEffortOption(overrides: {
+  currentValue?: string;
+} = {}): SessionConfigOption {
+  return {
+    id: "reasoning_effort",
+    name: "Reasoning Effort",
+    type: "select",
+    // dsh 实测配对：id=reasoning_effort 但 category=thought_level。
+    category: "thought_level",
+    currentValue: overrides.currentValue ?? "high",
+    options: [
+      { value: "off", name: "Off" },
+      { value: "low", name: "Low" },
+      { value: "high", name: "High" },
+      { value: "max", name: "Max" },
+    ],
+  };
+}
+
+const dshDefinition: AcpRuntimeDefinition = {
+  kind: "dsh",
+  displayName: "Fake dsh",
+  buildCommand: () => ({ file: "fake-acp", args: [] }),
+};
+
+test("probe snapshot carries CodeBuddy thought_level choices without a current value", async () => {
+  const fake = fakeConnector({
+    sessionConfigOptions: [modelOption(), thoughtLevelOption({ currentValue: "high" })],
+  });
+  const snapshot = await probeAcpModelState(
+    definition,
+    { agentId: "developer", cwd: "D:/workspace" },
+    fake.connector,
+  );
+  assert.equal(snapshot?.reasoning?.configId, "thought_level");
+  assert.deepEqual(snapshot?.reasoning?.choices, [
+    { value: "enabled", name: "Enabled" },
+    { value: "high", name: "High" },
+  ]);
+  assert.equal(snapshot?.reasoning?.currentValue, undefined, "探测会话不得伪造员工当前思考强度");
+  assert.equal(snapshot?.reasoning?.currentValueSource, "probe");
+});
+
+test("probe snapshot carries dsh reasoning_effort choices", async () => {
+  const fake = fakeConnector({
+    sessionConfigOptions: [reasoningEffortOption()],
+  });
+  const snapshot = await probeAcpModelState(
+    dshDefinition,
+    { agentId: "developer", cwd: "D:/workspace" },
+    fake.connector,
+  );
+  assert.equal(snapshot?.reasoning?.configId, "reasoning_effort");
+  assert.deepEqual(
+    snapshot?.reasoning?.choices.map((choice) => choice.value),
+    ["off", "low", "high", "max"],
+  );
+});
+
+test("reasoning snapshot ignores non-allowlisted selects and mismatched categories", async () => {
+  const fake = fakeConnector({
+    sessionConfigOptions: [
+      modelOption(),
+      {
+        id: "sandbox",
+        name: "Sandbox",
+        type: "select",
+        category: "sandbox",
+        currentValue: "true",
+        options: [
+          { value: "true", name: "On" },
+          { value: "false", name: "Off" },
+        ],
+      } satisfies SessionConfigOption,
+      // id 对但 category 不对：不得当作思考强度。
+      thoughtLevelOption({ category: "mode" }),
+    ],
+  });
+  const snapshot = await probeAcpModelState(
+    definition,
+    { agentId: "developer", cwd: "D:/workspace" },
+    fake.connector,
+  );
+  assert.equal(snapshot?.reasoning, undefined);
+});
+
+test("applies reasoning after the model, before the prompt", async () => {
+  const fake = fakeConnector({
+    answerText: "hello",
+    sessionConfigOptions: [modelOption(), thoughtLevelOption({ currentValue: "enabled" })],
+    setConfigOptionConfigOptions: [modelOption({ currentValue: "model-b" }), thoughtLevelOption({ currentValue: "enabled" })],
+  });
+  const notices: string[] = [];
+  const handle = runAcp(
+    runOptions({
+      preferredModelId: "model-b",
+      preferredReasoningValue: "high",
+      onActivity: (activity: AgentActivityEvent) => { if (activity.type === "process.text") notices.push(activity.text); },
+    }),
+    definition,
+    fake.connector,
+  );
+  await handle.result;
+
+  const modelSet = "session/set_config_option:fake-session:model:model-b";
+  const reasoningSet = "session/set_config_option:fake-session:thought_level:high";
+  assert.ok(fake.calls.includes(modelSet), `missing model set in: ${fake.calls.join(", ")}`);
+  assert.ok(fake.calls.includes(reasoningSet), `missing reasoning set in: ${fake.calls.join(", ")}`);
+  assert.ok(fake.calls.indexOf(modelSet) < fake.calls.indexOf(reasoningSet), "模型必须先于思考强度下发");
+  assert.ok(fake.calls.indexOf(reasoningSet) < fake.calls.indexOf("session/prompt:fake-session"));
+  assert.ok(notices.some((text) => text.includes("思考强度已切换为 High")));
+});
+
+test("reasoning dropped by the post-model options is never silently substituted", async () => {
+  const fake = fakeConnector({
+    answerText: "hello",
+    sessionConfigOptions: [
+      modelOption(),
+      thoughtLevelOption({ currentValue: "high" }),
+    ],
+    // 模型切换后 thought_level 只剩 high：偏好 enabled 已失效。
+    setConfigOptionConfigOptions: [
+      modelOption({ currentValue: "model-b" }),
+      thoughtLevelOption({ currentValue: "high", options: [{ value: "high", name: "High" }] }),
+    ],
+  });
+  const notices: string[] = [];
+  const handle = runAcp(
+    runOptions({
+      preferredModelId: "model-b",
+      preferredReasoningValue: "enabled",
+      onActivity: (activity: AgentActivityEvent) => { if (activity.type === "process.text") notices.push(activity.text); },
+    }),
+    definition,
+    fake.connector,
+  );
+  const answer = await handle.result;
+
+  assert.equal(answer, "hello");
+  assert.ok(fake.calls.includes("session/set_config_option:fake-session:model:model-b"));
+  assert.ok(!fake.calls.some((call) => call.includes("thought_level")), "失效偏好不得下发任何思考强度设置");
+  assert.ok(notices.some((text) => text.includes("首选思考强度 enabled 当前不可用") && text.includes("未做替换")));
+});
+
+test("no reasoning preference means no reasoning set call", async () => {
+  const fake = fakeConnector({
+    answerText: "hello",
+    sessionConfigOptions: [modelOption(), thoughtLevelOption()],
+  });
+  const handle = runAcp(runOptions({ preferredModelId: "model-b" }), definition, fake.connector);
+  await handle.result;
+  assert.ok(!fake.calls.some((call) => call.includes("thought_level")));
+});
+
+test("reasoning already at the preferred value is not re-sent", async () => {
+  const fake = fakeConnector({
+    answerText: "hello",
+    sessionConfigOptions: [modelOption(), thoughtLevelOption({ currentValue: "high" })],
+  });
+  const handle = runAcp(runOptions({ preferredReasoningValue: "high" }), definition, fake.connector);
+  await handle.result;
+  assert.ok(!fake.calls.some((call) => call.startsWith("session/set_config_option:")));
+});
+
+test("a failed reasoning switch only warns and never fails the run", async () => {
+  const fake = fakeConnector({
+    answerText: "hello",
+    sessionConfigOptions: [modelOption(), thoughtLevelOption()],
+    setConfigOptionError: new Error("config backend offline"),
+  });
+  const notices: string[] = [];
+  const handle = runAcp(
+    runOptions({
+      preferredReasoningValue: "high",
+      onActivity: (activity: AgentActivityEvent) => { if (activity.type === "process.text") notices.push(activity.text); },
+    }),
+    definition,
+    fake.connector,
+  );
+  const answer = await handle.result;
+  assert.equal(answer, "hello");
+  assert.ok(notices.some((text) => text.includes("思考强度切换失败") && text.includes("config backend offline")));
+});
+
+const codexDefinition: AcpRuntimeDefinition = {
+  kind: "codex",
+  displayName: "Fake Codex",
+  buildCommand: () => ({ file: "fake-acp", args: [] }),
+};
+
+const variantModels = {
+  currentModelId: "gpt-6.1-terra[xhigh]",
+  availableModels: [
+    { modelId: "gpt-6.1-terra[xhigh]", name: "GPT-6.1 Terra (Extra High)" },
+    { modelId: "gpt-5.6-terra[high]", name: "GPT-5.6 Terra (High)" },
+    { modelId: "gpt-5.6-terra[medium]", name: "GPT-5.6 Terra (Medium)" },
+  ],
+};
+
+test("legacyModelStateOf parses variant models and rejects junk", () => {
+  assert.equal(legacyModelStateOf(null), undefined);
+  assert.equal(legacyModelStateOf({ models: { availableModels: [] } }), undefined);
+  assert.equal(legacyModelStateOf({ models: { availableModels: [{ name: "x" }] } }), undefined);
+  const parsed = legacyModelStateOf({ models: variantModels });
+  assert.equal(parsed?.currentModelId, "gpt-6.1-terra[xhigh]");
+  assert.equal(parsed?.availableModels.length, 3);
+});
+
+test("probe snapshot uses Codex variant models as the model list", async () => {
+  const fake = fakeConnector({
+    sessionConfigOptions: [modelOption()],
+    sessionModels: variantModels,
+  });
+  const snapshot = await probeAcpModelState(
+    codexDefinition,
+    { agentId: "developer", cwd: "D:/workspace" },
+    fake.connector,
+  );
+  assert.equal(snapshot?.modelApplyPath, "session_model");
+  assert.deepEqual(
+    snapshot?.choices.map((choice) => choice.value),
+    ["gpt-6.1-terra[xhigh]", "gpt-5.6-terra[high]", "gpt-5.6-terra[medium]"],
+  );
+  assert.equal(snapshot?.currentValue, undefined, "探测会话不得伪造员工当前变体");
+});
+
+test("variant preference is applied only via session/set_model", async () => {
+  const snapshots: AgentModelStateSnapshot[] = [];
+  const notices: string[] = [];
+  const fake = fakeConnector({
+    answerText: "hello",
+    sessionConfigOptions: [modelOption()],
+    sessionModels: variantModels,
+  });
+  const handle = runAcp(
+    runOptions({
+      preferredModelId: "gpt-5.6-terra[high]",
+      onSessionConfig: (snapshot: AgentModelStateSnapshot) => { snapshots.push(snapshot); },
+      onActivity: (activity: AgentActivityEvent) => { if (activity.type === "process.text") notices.push(activity.text); },
+    }),
+    codexDefinition,
+    fake.connector,
+  );
+  const answer = await handle.result;
+  assert.equal(answer, "hello");
+  assert.ok(fake.calls.includes("session/set_model:fake-session:gpt-5.6-terra[high]"), `calls: ${fake.calls.join(", ")}`);
+  assert.ok(!fake.calls.some((call) => call.includes("set_config_option")), "变体路径不得再走 config option 下发");
+  const last = snapshots[snapshots.length - 1];
+  assert.equal(last?.modelApplyPath, "session_model");
+  assert.equal(last?.currentValue, "gpt-5.6-terra[high]");
+  assert.ok(notices.some((text) => text.includes("模型已切换为 GPT-5.6 Terra (High)")));
+});
+
+test("a base model id outside the variant list is reported, never sent anywhere", async () => {
+  const notices: string[] = [];
+  const fake = fakeConnector({
+    answerText: "hello",
+    sessionConfigOptions: [modelOption()],
+    sessionModels: variantModels,
+  });
+  const handle = runAcp(
+    runOptions({
+      preferredModelId: "model-b",
+      onActivity: (activity: AgentActivityEvent) => { if (activity.type === "process.text") notices.push(activity.text); },
+    }),
+    codexDefinition,
+    fake.connector,
+  );
+  await handle.result;
+  assert.ok(!fake.calls.some((call) => call.includes("set_model:")), `calls: ${fake.calls.join(", ")}`);
+  assert.ok(!fake.calls.some((call) => call.includes("set_config_option")), "基础 id 不得经 config 路径偷下发");
+  assert.ok(notices.some((text) => text.includes("未在当前变体清单内") && text.includes("未做替换")));
+});
+
+test("variant already in effect is not re-sent", async () => {
+  const fake = fakeConnector({
+    answerText: "hello",
+    sessionConfigOptions: [modelOption()],
+    sessionModels: { ...variantModels, currentModelId: "gpt-5.6-terra[high]" },
+  });
+  const handle = runAcp(runOptions({ preferredModelId: "gpt-5.6-terra[high]" }), codexDefinition, fake.connector);
+  await handle.result;
+  assert.ok(!fake.calls.some((call) => call.includes("set_model:")));
+});
+
+test("missing setModel support is reported instead of falling back", async () => {
+  const notices: string[] = [];
+  const fake = fakeConnector({
+    answerText: "hello",
+    sessionConfigOptions: [modelOption()],
+    sessionModels: variantModels,
+    omitSetModel: true,
+  });
+  const handle = runAcp(
+    runOptions({
+      preferredModelId: "gpt-5.6-terra[high]",
+      onActivity: (activity: AgentActivityEvent) => { if (activity.type === "process.text") notices.push(activity.text); },
+    }),
+    codexDefinition,
+    fake.connector,
+  );
+  const answer = await handle.result;
+  assert.equal(answer, "hello");
+  assert.ok(notices.some((text) => text.includes("不支持变体模型下发")));
+  assert.ok(!fake.calls.some((call) => call.includes("set_config_option")));
+});
+
+test("config-option snapshots never clobber a variant snapshot (carry-over)", () => {
+  const options = runOptions({
+    lastSessionConfig: {
+      agentId: "developer",
+      runtimeKind: "codex",
+      configId: "model",
+      choices: variantModels.availableModels.map((entry) => ({ value: entry.modelId, name: entry.name })),
+      currentValue: "gpt-5.6-terra[high]",
+      currentValueSource: "session",
+      modelApplyPath: "session_model",
+      updatedAt: new Date().toISOString(),
+    },
+  });
+  const snapshot = toModelSnapshot([modelOption()], options, codexDefinition);
+  assert.equal(snapshot?.modelApplyPath, "session_model");
+  assert.equal(snapshot?.currentValue, "gpt-5.6-terra[high]");
+  assert.deepEqual(
+    snapshot?.choices.map((choice) => choice.value),
+    ["gpt-6.1-terra[xhigh]", "gpt-5.6-terra[high]", "gpt-5.6-terra[medium]"],
+  );
 });
 
 // ---- issue #160 收尾：斜杠命令主动探测（“输入 / 无反应”的冷启动修复） ----
