@@ -210,3 +210,52 @@ test("supervised: unassigned user message routes to no employee and stays silent
   assert.equal(systemMessages.length, 0);
   assert.deepEqual(routeStates, ["ignored"]);
 });
+
+// ---- 普通对话默认接收员工（Dot 0076）----
+
+test("direct mode: an explicit assignment becomes the conversation default receiver", () => {
+  const { router, agentRuns, state } = createRouter({ mode: "direct" });
+  router.process(message("user", "@甄架构: 先看方案"));
+  assert.deepEqual(agentRuns.map((run) => run.agentId), ["agent1"]);
+  assert.equal(state.lastDirectAgentId, "agent1");
+});
+
+test("direct mode: a later explicit assignment replaces the default receiver", () => {
+  const { router, state } = createRouter({ mode: "direct" });
+  router.process(message("user", "@甄架构: 先看方案"));
+  router.process(message("user", "@蔡一平: 换你来做"));
+  assert.equal(state.lastDirectAgentId, "agent2");
+});
+
+test("direct mode: a mentionless message goes to the default receiver", () => {
+  const { router, agentRuns, systemMessages } = createRouter({ mode: "direct", lastDirectAgentId: "agent2" });
+  router.process(message("user", "继续吧"));
+  assert.deepEqual(agentRuns.map((run) => run.agentId), ["agent2"]);
+  assert.equal(systemMessages.length, 0);
+});
+
+test("direct mode: without a default, a mentionless message asks for a target and dispatches nothing", () => {
+  const { router, agentRuns, systemMessages, routeStates } = createRouter({ mode: "direct" });
+  router.process(message("user", "有人吗"));
+  assert.equal(agentRuns.length, 0);
+  assert.equal(systemMessages.length, 1);
+  assert.match(systemMessages[0]!, /@一位数字员工/);
+  assert.deepEqual(routeStates, ["blocked"]);
+});
+
+test("direct mode: assigning two employees at once is ambiguous - blocked and the default is unchanged", () => {
+  const { router, agentRuns, systemMessages, state } = createRouter({ mode: "direct", lastDirectAgentId: "agent1" });
+  router.process(message("user", "@甄架构: 规划; @蔡一平: 施工"));
+  assert.equal(agentRuns.length, 0);
+  assert.equal(systemMessages.length, 1);
+  assert.equal(state.lastDirectAgentId, "agent1");
+});
+
+test("direct mode: agent replies never dispatch and never become the default receiver", () => {
+  const { router, agentRuns, state } = createRouter({ mode: "direct", lastDirectAgentId: "agent2" });
+  // 上一位发言者（agent1）的回复里即使带指派标记，也只是文本展示：
+  // 默认接收者只能由用户显式指定，绝不能按最后发言者推断（Dot 0076）。
+  router.process(message("agent", "@甄架构: 我讲完了", { agentId: "agent1" }));
+  assert.equal(agentRuns.length, 0);
+  assert.equal(state.lastDirectAgentId, "agent2");
+});

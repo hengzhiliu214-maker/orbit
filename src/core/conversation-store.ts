@@ -49,7 +49,7 @@ export class ConversationStore {
     name?: string;
     interactionMode?: InteractionMode;
     supervisorConfig?: SupervisorConfig | null;
-    lastDirectAgentId?: AgentId;
+    lastDirectAgentId?: AgentId | null;
   }): Conversation {
     const data = this.loadData(workspaceId);
     const index = data.conversations.findIndex((c) => c.id === conversationId);
@@ -65,7 +65,11 @@ export class ConversationStore {
           ? { supervisorConfig: undefined, supervisionRuntime: undefined }
           : { supervisorConfig: patch.supervisorConfig }
         : {}),
-      ...(patch.lastDirectAgentId !== undefined ? { lastDirectAgentId: patch.lastDirectAgentId } : {}),
+      ...(patch.lastDirectAgentId !== undefined
+        ? patch.lastDirectAgentId === null
+          ? { lastDirectAgentId: undefined }
+          : { lastDirectAgentId: patch.lastDirectAgentId }
+        : {}),
     };
     this.saveData(workspaceId, data);
     return data.conversations[index]!;

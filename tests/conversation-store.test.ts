@@ -84,6 +84,18 @@ test("last direct employee persists alongside mode switches away and back", () =
   assert.equal(reloaded.lastDirectAgentId, "developer");
 });
 
+test("last direct employee can be cleared explicitly with null", () => {
+  const dir = tmpDir();
+  const store = new ConversationStore(dir);
+  const conv = store.create("ws1", "Direct chat");
+
+  store.update("ws1", conv.id, { lastDirectAgentId: "developer" });
+  store.update("ws1", conv.id, { lastDirectAgentId: null });
+
+  const reloaded = new ConversationStore(dir).get("ws1", conv.id)!;
+  assert.equal(reloaded.lastDirectAgentId, undefined);
+});
+
 test("invalid interaction mode falls back to direct on reload", () => {
   const dir = tmpDir();
   const store = new ConversationStore(dir);

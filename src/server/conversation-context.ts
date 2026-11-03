@@ -35,7 +35,7 @@ const MAX_ROUTE_DEPTH = 10;
 export type ConversationContextPatch = {
   interactionMode?: InteractionMode;
   supervisorConfig?: SupervisorConfig | null;
-  lastDirectAgentId?: AgentId;
+  lastDirectAgentId?: AgentId | null;
 };
 
 export type ConversationContextOptions = {
@@ -319,6 +319,10 @@ export class ConversationContext {
         INTERNAL_SUPERVISOR_ID,
         config.model?.runtimeKind === config.runtime ? config.model?.preferredModelId : undefined,
       );
+      this.agents.updatePreferredReasoning(
+        INTERNAL_SUPERVISOR_ID,
+        config.model?.runtimeKind === config.runtime ? config.model?.preferredReasoningValue : undefined,
+      );
       this._supervisorConfig = config;
     }
     this.options.onConversationPatch?.({ supervisorConfig: config });
@@ -359,6 +363,21 @@ export class ConversationContext {
   private handleLastDirectAgentChange(agentId: AgentId): void {
     if (this._lastDirectAgentId === agentId) return;
     this._lastDirectAgentId = agentId;
+    this.options.onConversationPatch?.({ lastDirectAgentId: agentId });
+  }
+
+  /**
+   * 手动设置/清除普通对话的默认接收员工（Dot 0076）：绑定稳定 agentId，
+   * 必须是本会话工作区内真实存在且非内部的员工；null 表示清除默认，
+   * 此后无 @ 的消息会要求用户先指定，不静默改派。
+   */
+  setDefaultDirectAgent(agentId: AgentId | null): void {
+    if (agentId !== null && !this._profiles.some((profile) => profile.id === agentId && !profile.internal)) {
+      throw new Error(`Unknown agent for this conversation: ${agentId}`);
+    }
+    const next = agentId ?? undefined;
+    if (this._lastDirectAgentId === next) return;
+    this._lastDirectAgentId = next;
     this.options.onConversationPatch?.({ lastDirectAgentId: agentId });
   }
 
