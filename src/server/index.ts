@@ -10,6 +10,7 @@ import { disposeAcpConnectionPool, probeAcpModelState } from "../core/acp-runtim
 import { defaultAcpRunnerRegistry } from "../core/acp-runner-registry.ts";
 import { AGENT_TEAM_TEMPLATES, AgentConfigStore, validateAgentConfigs } from "../core/agent-config-store.ts";
 import { AgentModelStateStore, supervisorStorageKey } from "../core/agent-model-state-store.ts";
+import { findStaleSnapshotPreferenceOverwrite } from "../core/agent-model-guard.ts";
 import { probeAllRuntimes, runtimeKindToCliKey, type RuntimeProbeResult } from "../core/runtime-probe.ts";
 import type { AgentConfig } from "../core/agent-config-store.ts";
 import { WorkspaceConfigStore } from "../core/workspace-config-store.ts";
@@ -182,11 +183,26 @@ async function probeConfiguredAgentModels(
         const storageKey = isSupervisor ? supervisorStorageKey(targetConversationId!) : target.id;
         const previous = existing[storageKey];
         const hasSessionValue = previous?.runtimeKind === runtimeKind && previous.currentValueSource === "session";
+        // 探针只是预览（Dot 0055 合同）：已有会话确认状态时，探针写回不得
+        // 覆盖会话已确认的思考强度当前值，也不得把变体快照降级回基础
+        // 模型形态——两处都与 currentValue 一样以会话值为准（复核 P1/P2）。
+        const reasoning = hasSessionValue && previous.reasoning && snapshot.reasoning?.configId === previous.reasoning.configId
+          ? { ...snapshot.reasoning, currentValue: previous.reasoning.currentValue, currentValueSource: "session" as const }
+          : hasSessionValue && previous.reasoning && !snapshot.reasoning
+            ? previous.reasoning
+            : snapshot.reasoning;
+        const keepVariant = hasSessionValue &&
+          previous.modelApplyPath === "session_model" &&
+          snapshot.modelApplyPath !== "session_model";
         const targetSnapshot = {
           ...snapshot,
           agentId: target.id,
           currentValue: hasSessionValue ? previous.currentValue : undefined,
           currentValueSource: hasSessionValue ? "session" as const : "probe" as const,
+          ...(reasoning ? { reasoning } : {}),
+          ...(keepVariant
+            ? { choices: previous.choices, configId: previous.configId, modelApplyPath: "session_model" as const }
+            : {}),
         };
         agentModelStateStore.update(workspaceId, targetSnapshot, storageKey);
         sseHub.publish({
@@ -709,14 +725,14 @@ runAttachmentDraftCleanup();
 function parseSupervisorConfig(input: { runtime?: unknown; model?: unknown }):
   { config: SupervisorConfig } | { error: string } {
   if (!isAgentRuntimeKind(input.runtime)) {
-    return { error: "监工运行时必须是 claude-code、codex 或 codebuddy。" };
+    return { error: "监工运行时必须是 claude-code、codex、codebuddy、dsh 或 workbuddy。" };
   }
   const runtime = input.runtime;
   if (input.model === undefined || input.model === null) return { config: { runtime } };
   if (typeof input.model !== "object" || Array.isArray(input.model)) {
     return { error: "监工模型配置格式不正确。" };
   }
-  const model = input.model as { preferredModelId?: unknown; runtimeKind?: unknown };
+  const model = input.model as { preferredModelId?: unknown; preferredReasoningValue?: unknown; runtimeKind?: unknown };
   if (model.runtimeKind !== undefined && !isAgentRuntimeKind(model.runtimeKind)) {
     return { error: "监工模型配置格式不正确。" };
   }
@@ -725,17 +741,32 @@ function parseSupervisorConfig(input: { runtime?: unknown; model?: unknown }):
     && typeof model.preferredModelId !== "string") {
     return { error: "监工模型配置格式不正确。" };
   }
+  if (model.preferredReasoningValue !== undefined
+    && model.preferredReasoningValue !== null
+    && typeof model.preferredReasoningValue !== "string") {
+    return { error: "监工模型配置格式不正确。" };
+  }
   const preferredModelId = typeof model.preferredModelId === "string"
     ? model.preferredModelId.trim()
     : "";
   if (preferredModelId.length > 512) {
     return { error: "监工模型标识过长。" };
   }
-  if (!preferredModelId) return { config: { runtime } };
+  const preferredReasoningValue = typeof model.preferredReasoningValue === "string"
+    ? model.preferredReasoningValue.trim()
+    : "";
+  if (preferredReasoningValue.length > 512) {
+    return { error: "监工思考强度标识过长。" };
+  }
+  if (!preferredModelId && !preferredReasoningValue) return { config: { runtime } };
   return {
     config: {
       runtime,
-      model: { preferredModelId, runtimeKind: isAgentRuntimeKind(model.runtimeKind) ? model.runtimeKind : runtime },
+      model: {
+        ...(preferredModelId ? { preferredModelId } : {}),
+        ...(preferredReasoningValue ? { preferredReasoningValue } : {}),
+        runtimeKind: isAgentRuntimeKind(model.runtimeKind) ? model.runtimeKind : runtime,
+      },
     },
   };
 }
@@ -1608,6 +1639,37 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+
+    // 默认接收员工（Dot 0076）：普通对话模式下无 @ 消息的固定收件人。
+    // 只改会话记录，不发送任何消息；agentId 必须是本工作区员工，null 为清除。
+    if (req.method === "PUT" && url.pathname.startsWith("/api/conversations/") && url.pathname.endsWith("/default-agent")) {
+      const parts = url.pathname.split("/");
+      const convId = parts[3];
+      if (!convId) { sendJson(res, 400, { ok: false, message: "Missing conversation id." }); return; }
+      const target = resolveTarget(url);
+      if (!target || target.conversationId !== convId) {
+        sendJson(res, 409, { ok: false, message: "workspaceId and conversationId are required." });
+        return;
+      }
+      const input = (await readJson(req)) as { agentId?: unknown };
+      if (input.agentId !== null && typeof input.agentId !== "string") {
+        sendJson(res, 400, { ok: false, message: "agentId (string or null) is required." });
+        return;
+      }
+      const ctx = contextForTarget(target);
+      if (!ctx) { sendJson(res, 409, { ok: false, message: "No active conversation context." }); return; }
+      try {
+        const current = conversationStoreFor(target.workspaceId).get(target.workspaceId, convId);
+        if (!current) throw new Error("Conversation not found.");
+        ctx.setDefaultDirectAgent(input.agentId as AgentId | null);
+        const updated = conversationStoreFor(target.workspaceId).get(target.workspaceId, convId) ?? current;
+        sendJson(res, 200, { ok: true, conversation: updated });
+      } catch (error) {
+        sendJson(res, 409, { ok: false, message: error instanceof Error ? error.message : String(error) });
+      }
+      return;
+    }
+
     if (req.method === "PUT" && url.pathname.startsWith("/api/conversations/")) {
       const parts = url.pathname.split("/");
       const convId = parts[3];
@@ -2134,6 +2196,23 @@ async function handlePutAgents(req: http.IncomingMessage, res: http.ServerRespon
 
   // modelState 是 GET 响应合并的运行时快照，保存前剥离，避免污染 agents.json。
   const configs = input.map(({ modelState: _modelState, modelProbe: _modelProbe, ...config }) => config);
+  // 设置页保存防护：载荷偏好若恰好等于过期会话快照的当前值、且与库内已保存
+  // 偏好不同，拒绝保存，避免把较新的模型偏好静默盖回旧值。注意：刷新模型
+  // 列表不会自动解开拦截——mergeProbedConfigs 保留本地未保存的选择；解开
+  // 靠关闭面板不保存、重开后改回已保存偏好，或改选新值（Dot 0094 口径，
+  // 详见 agent-model-guard.ts）。
+  const staleOverwrite = findStaleSnapshotPreferenceOverwrite(
+    configStore.load(workspaceId),
+    configs,
+    agentModelStateStore.load(workspaceId),
+  );
+  if (staleOverwrite) {
+    sendJson(res, 409, {
+      ok: false,
+      message: `员工「${staleOverwrite.agentName}」的${staleOverwrite.field === "model" ? "模型" : "思考强度"}偏好已拒绝保存：提交的值与一份较早的会话记录相同，可能来自过期的模型列表，保存会覆盖较新的偏好。解开方法：关闭设置面板且不要保存，重新打开设置面板后直接保存（重新打开时当前选中项即已保存的偏好，未保存的更改会丢失）；或改选一个不等于该旧记录值的新偏好。注意：点「刷新模型列表」只会更新可选列表，不会自动把已修改的选择改回已保存偏好。本拦截只针对这一种过期值覆盖（特定签名），并非通用的并发保存保护。`,
+    });
+    return;
+  }
   configStore.save(workspaceId, configs);
   refreshEnabledAgentsForWorkspace(workspaceId, configs);
   if (workspaceId === activeWorkspaceId) allConfigs = configs;
