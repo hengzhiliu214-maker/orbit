@@ -18,6 +18,10 @@
   <a href="package.json"><img src="https://img.shields.io/badge/node-%3E%3D22-339933.svg" alt="Node.js 22 或更高版本"></a>
 </p>
 
+> **关于这个 fork，先看这里。**
+> 本仓库是上游项目 [kevinforge/orbit](https://github.com/kevinforge/orbit) 的 **fork**，基线是上游 **v1.4.0**。上游作者归属与 MIT 许可证原样保留（见根目录 `LICENSE`）。本 fork 改了什么、与上游有哪些现状差异，写在 [docs/PROJECT-ORIGIN.md](docs/PROJECT-ORIGIN.md) 和 [docs/FORK-STATUS.md](docs/FORK-STATUS.md) 里。
+> 本 README 其余部分的安装、发布与支持说明，描述的是**上游**项目及其已发布软件包。本 fork 不发布版本；实际在用的版本是未经发布的本地维护版本。
+
 ## Orbit 是什么
 
 Orbit 可以把一个本地项目目录变成一个数字员工协作工作台。你可以创建一支由多个数字员工组成的团队，为每个员工配置角色、提示词和执行运行时，再通过一个共享会话来安排需求澄清、方案设计、代码实现、测试验证和任务交接。
