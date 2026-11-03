@@ -1,5 +1,6 @@
 import path from "node:path";
 
+import type { RecoveryPrompt } from "../core/agent-runtime.ts";
 import { AgentRegistry } from "../core/agent-registry.ts";
 import { buildAgentContext } from "../core/agent-context-builder.ts";
 import { buildHistoryForAgent, SUPERVISOR_HISTORY_TURNS } from "../core/agent-history-builder.ts";
@@ -131,6 +132,8 @@ export class ConversationContext {
       eventBus,
       buildPrompt: (agentId, prompt, sourceMessageId, sourceAttachments, interactionMode) =>
         self.buildRuntimePrompt(agentId, prompt, sourceMessageId, sourceAttachments, interactionMode),
+      buildRecoveryPrompt: (agentId, prompt, sourceMessageId, sourceAttachments, interactionMode) =>
+        self.buildRuntimePromptContext(agentId, prompt, sourceMessageId, sourceAttachments, interactionMode, true),
       onRunCompleted: (message) => {
         self.messageRouter.process(message);
       },
@@ -230,6 +233,8 @@ export class ConversationContext {
       eventBus,
       buildPrompt: (agentId, prompt, sourceMessageId, sourceAttachments, interactionMode) =>
         self.buildRuntimePrompt(agentId, prompt, sourceMessageId, sourceAttachments, interactionMode),
+      buildRecoveryPrompt: (agentId, prompt, sourceMessageId, sourceAttachments, interactionMode) =>
+        self.buildRuntimePromptContext(agentId, prompt, sourceMessageId, sourceAttachments, interactionMode, true),
       onRunCompleted: (message) => {
         self.messageRouter.process(message);
       },
@@ -340,11 +345,23 @@ export class ConversationContext {
     sourceAttachments?: MessageAttachment[],
     interactionMode?: InteractionMode,
   ): string {
+    return this.buildRuntimePromptContext(agentId, prompt, sourceMessageId, sourceAttachments, interactionMode).prompt;
+  }
+
+  private buildRuntimePromptContext(
+    agentId: AgentId,
+    prompt: string,
+    sourceMessageId?: string,
+    sourceAttachments?: MessageAttachment[],
+    interactionMode?: InteractionMode,
+    includeCompletedHistory = false,
+  ): RecoveryPrompt {
     const history = buildHistoryForAgent(agentId, this.messages.list(), {
       excludeMessageId: sourceMessageId,
+      includeCompletedHistory,
       ...(agentId === INTERNAL_SUPERVISOR_ID ? { maxTurns: SUPERVISOR_HISTORY_TURNS } : {}),
     });
-    return buildAgentContext({
+    const runtimePrompt = buildAgentContext({
       agentId,
       profiles: agentId === INTERNAL_SUPERVISOR_ID ? this.channelProfiles() : this._profiles,
       agentMessage: prompt,
@@ -354,6 +371,7 @@ export class ConversationContext {
       workspaceConfig: this._workspaceConfig,
       attachments: sourceAttachments,
     });
+    return { prompt: runtimePrompt, historyIncluded: history.length > 0 };
   }
 
   private handleLastDirectAgentChange(agentId: AgentId): void {

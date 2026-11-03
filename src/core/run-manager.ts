@@ -15,7 +15,7 @@ import { randomBytes } from "node:crypto";
 import type { EventBus } from "./event-bus.ts";
 import type { MessageStore } from "./message-store.ts";
 import { parseJsonObjects } from "./json-stream-parser.ts";
-import { isAgentRunCancelledError } from "./agent-runtime.ts";
+import { type RecoveryPrompt, isAgentRunCancelledError } from "./agent-runtime.ts";
 import { appendTransientProcessActivity, buildPersistedProcessTimeline, withoutAnswerGroup } from "../shared/process-activity.ts";
 
 const TERMINAL_RUN_RETENTION_MS = 5 * 60 * 1000;
@@ -23,7 +23,7 @@ const MAX_TERMINAL_RUN_INDEX_SIZE = 1024;
 
 type AgentRunner = {
   get(agentId: AgentId): {
-    send(runId: string, prompt: string, attachments?: readonly MessageAttachment[], approvalMode?: ApprovalMode): Promise<RunResult>;
+    send(runId: string, prompt: string, attachments?: readonly MessageAttachment[], approvalMode?: ApprovalMode, recoveryPrompt?: () => RecoveryPrompt): Promise<RunResult>;
     /** Request runtime cancellation; the runtime may fall back to process termination. */
     interrupt(runId: string): boolean;
   };
@@ -75,6 +75,7 @@ export type RunManagerOptions = {
   messages: MessageStore;
   eventBus: EventBus;
   buildPrompt: (agentId: AgentId, prompt: string, sourceMessageId?: string, sourceAttachments?: MessageAttachment[], interactionMode?: InteractionMode) => string;
+  buildRecoveryPrompt?: (...args: Parameters<RunManagerOptions["buildPrompt"]>) => RecoveryPrompt;
   onRunCompleted: (message: ChatMessage) => void;
   /** Resolves a user-facing display name for an agent id (defaults to the raw id). */
   getAgentLabel?: (agentId: AgentId) => string;
@@ -481,6 +482,9 @@ export class RunManager {
         runtimePrompt,
         run.sourceAttachments,
         run.sourceMessage.approvalMode ?? "ask",
+        !run.nativePrompt && this.options.buildRecoveryPrompt
+          ? () => this.options.buildRecoveryPrompt!(run.agentId, run.prompt, excludedSourceMessageId, run.sourceAttachments, run.interactionMode)
+          : undefined,
       );
     } catch (error: unknown) {
       this.fail(run, error instanceof Error ? error.message : String(error));
@@ -548,9 +552,10 @@ export class RunManager {
 
   // Design note: fail() intentionally does NOT check suppressFollowupRouting.
   // Unlike complete(), fail() never calls onRunCompleted (error content should not
-  // be auto-routed), and run.failed events are not subscribed to by
-  // ChannelWatchService. If a future change adds routing subscribers to run.failed,
-  // add the suppressFollowupRouting check here to match complete().
+  // be auto-routed). ChannelWatchService DOES subscribe to run.failed, but only to
+  // trigger a supervisor coordination prompt, not to re-deliver the user prompt.
+  // If a future change adds user-prompt routing to run.failed, add the
+  // suppressFollowupRouting check here to match complete().
   private fail(run: ManagedRun, error: string): void {
     if (run.status === "cancelled") {
       return;

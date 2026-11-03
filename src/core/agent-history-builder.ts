@@ -11,6 +11,8 @@ export { MAX_HISTORY_CHARS, OLDER_ENTRY_MAX_CHARS, RECENT_UNTRUNCATED_COUNT, SUP
 export type BuildHistoryOptions = {
   /** Exclude this specific message (typically the current run's source message) */
   excludeMessageId?: string;
+  /** A replacement backend session needs history before the last completed reply too. */
+  includeCompletedHistory?: boolean;
   /** Keep the latest N user-originated turns, including their agent replies. */
   maxTurns?: number;
 };
@@ -34,7 +36,7 @@ function keepRecentTurns(messages: ChatMessage[], maxTurns: number | undefined):
 
 export function buildHistoryForAgent(agentId: AgentId, allMessages: ChatMessage[], options?: BuildHistoryOptions): AgentHistoryEntry[] {
   let cutoffIndex = -1;
-  for (let i = allMessages.length - 1; i >= 0; i--) {
+  for (let i = allMessages.length - 1; !options?.includeCompletedHistory && i >= 0; i--) {
     const msg = allMessages[i];
     if (msg.kind === "agent" && msg.agentId === agentId && msg.status === "done") {
       cutoffIndex = i;

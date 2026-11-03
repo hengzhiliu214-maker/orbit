@@ -294,3 +294,17 @@ test("recent user assignment and UX feedback survive even when older messages fi
     `recent UX review must be present in history. Got ${history.length} entries`
   );
 });
+
+test("replacement history includes completed turns, excludes current source by id, and preserves budget", () => {
+  const messages = [
+    msg({ id: "anchor", kind: "user", content: "old anchor" }),
+    msg({ kind: "agent", agentId: "developer", content: "old answer", status: "done" }),
+    msg({ id: "source", kind: "user", content: "current request" }),
+    msg({ kind: "agent", content: "in progress", status: "running" }),
+  ];
+  assert.deepEqual(buildHistoryForAgent("developer", messages, { excludeMessageId: "source" }), []);
+  const history = buildHistoryForAgent("developer", messages, { excludeMessageId: "source", includeCompletedHistory: true });
+  assert.deepEqual(history.map(entry => entry.content), ["old anchor", "old answer"]);
+  const bounded = buildHistoryForAgent("developer", Array.from({length: 60}, () => msg({kind: "user", content: "x".repeat(1000)})), {includeCompletedHistory: true});
+  assert.ok(bounded.reduce((sum, entry) => sum + entry.content.length, 0) <= MAX_HISTORY_CHARS);
+});

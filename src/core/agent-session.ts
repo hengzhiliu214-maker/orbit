@@ -14,7 +14,7 @@ import type {
   RunResult,
   RuntimeEvent,
 } from "../shared/types.ts";
-import { isAgentRunCancelledError, type AgentRuntime } from "./agent-runtime.ts";
+import { isAgentRunCancelledError, type AgentRuntime, type RecoveryPrompt } from "./agent-runtime.ts";
 import { sanitizeAgentVisibleReply } from "./agent-prompt.ts";
 import { isCleanFinalAnswer } from "./claude-output-detector.ts";
 import { EventBus } from "./event-bus.ts";
@@ -136,7 +136,7 @@ export class AgentSession {
     }
   }
 
-  send(runId: string, prompt: string, attachments?: readonly MessageAttachment[], approvalMode: ApprovalMode = "ask"): Promise<RunResult> {
+  send(runId: string, prompt: string, attachments?: readonly MessageAttachment[], approvalMode: ApprovalMode = "ask", recoveryPrompt?: () => RecoveryPrompt): Promise<RunResult> {
     if (this.activeRun) {
       return Promise.reject(new Error(`${this.id} is already running`));
     }
@@ -149,9 +149,11 @@ export class AgentSession {
       this.options.runtime.kind, this.options.conversationId, this.id,
     );
 
-    return this.executeRun(runId, prompt, runIndex, existingSession?.sessionId ?? undefined, attachments, approvalMode)
+    return this.executeRun(runId, prompt, runIndex, existingSession?.sessionId ?? undefined, attachments, approvalMode, recoveryPrompt)
       .catch((error: unknown) => {
-        if (this.isResumeFailure(error, existingSession)) {
+        // ACP owns restoration before prompt delivery. Never replay a failed prompt
+        // based on its error text: it may already have performed side effects.
+        if (this.options.runtime.transport !== "acp" && this.isResumeFailure(error, existingSession)) {
           this.options.sessionStore.clear(
             this.options.runtime.kind, this.options.conversationId, this.id,
           );
@@ -283,6 +285,7 @@ export class AgentSession {
     resumeSessionId?: string,
     attachments?: readonly MessageAttachment[],
     approvalMode: ApprovalMode = "ask",
+    recoveryPrompt?: () => RecoveryPrompt,
   ): Promise<RunResult> {
     this.setStatus("running");
 
@@ -291,6 +294,7 @@ export class AgentSession {
       poolKey: `${this.options.conversationId}:${this.id}`,
       cwd: this.options.cwd,
       prompt,
+      recoveryPrompt,
       approvalMode,
       resumeSessionId,
       attachments,
