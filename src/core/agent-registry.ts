@@ -37,6 +37,7 @@ export class AgentRegistry {
       conversationId: this.conversationId,
       workspaceId: this.workspaceId,
       ...(profile.preferredModelId ? { preferredModelId: profile.preferredModelId } : {}),
+      ...(profile.preferredReasoningValue ? { preferredReasoningValue: profile.preferredReasoningValue } : {}),
       ...(this.modelState ? { modelState: this.modelState } : {}),
     }));
   }
@@ -104,6 +105,20 @@ export class AgentRegistry {
       return trimmed ? { ...rest, preferredModelId: trimmed } : rest;
     });
     session.setPreferredModelId(trimmed);
+    return true;
+  }
+
+  /** 更新员工的首选思考强度。语义同 updatePreferredModel：只改偏好，下一次运行生效。 */
+  updatePreferredReasoning(agentId: AgentId, preferredReasoningValue?: string): boolean {
+    const session = this.sessions.get(agentId);
+    if (!session) return false;
+    const trimmed = preferredReasoningValue?.trim() || undefined;
+    this.profilesById = this.profilesById.map((profile) => {
+      if (profile.id !== agentId) return profile;
+      const { preferredReasoningValue: _previous, ...rest } = profile;
+      return trimmed ? { ...rest, preferredReasoningValue: trimmed } : rest;
+    });
+    session.setPreferredReasoningValue(trimmed);
     return true;
   }
 

@@ -1,6 +1,9 @@
 import type { AgentRuntimeKind } from "../shared/types.ts";
 
-export const AGENT_RUNTIME_PRIORITY: readonly AgentRuntimeKind[] = ["claude-code", "codex", "codebuddy"];
+/** Preference order whenever a runtime is picked implicitly (supervisor seeding,
+ * preset fallback pools, settings-page defaults). Codex is the default first pick;
+ * claude-code remains selectable but is never the implicit default. */
+export const AGENT_RUNTIME_PRIORITY: readonly AgentRuntimeKind[] = ["codex", "codebuddy", "dsh", "workbuddy", "claude-code"];
 
 /** Map AgentRuntimeKind to the executable used by its transport. */
 export function runtimeKindToCliKey(runtime: string): string {
@@ -31,6 +34,18 @@ export function runtimeMeta(runtime: string): RuntimeMeta {
         label: "CodeBuddy",
         installUrl: "https://www.codebuddy.ai/docs/cli/installation",
         installCommand: "npm install -g @tencent-ai/codebuddy-code",
+      };
+    case "dsh":
+      return {
+        label: "DeepSeek Harness",
+        installUrl: "https://github.com/deepseek-ai/deepseek-harness",
+        installCommand: "",
+      };
+    case "workbuddy":
+      return {
+        label: "WorkBuddy",
+        installUrl: "https://www.workbuddy.ai",
+        installCommand: "",
       };
     default:
       return { label: runtime, installUrl: "", installCommand: "" };

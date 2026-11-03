@@ -5,42 +5,34 @@ import { type AgentConfig, type AgentId, type AgentRuntimeKind, type AgentTeamTe
 
 export type { AgentConfig };
 
-const VALID_RUNTIMES = new Set<AgentRuntimeKind>(["claude-code", "codex", "codebuddy"]);
+const VALID_RUNTIMES = new Set<AgentRuntimeKind>(["claude-code", "codex", "codebuddy", "dsh", "workbuddy"]);
 const RESERVED_IDS = new Set(["all", "user", "supervisor"]);
 const ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
 const NAME_PATTERN = /^[^\s@:]+$/u;
 
 export const DEFAULT_AGENT_CONFIGS: AgentConfig[] = [
   {
-    id: "requirements",
-    name: "范同经",
-    description: "梳理需求、拆分范围并定义可验证的完成标准。",
-    runtime: "codex",
-    systemPrompt: "你负责理解目标并把模糊需求整理成清晰、可执行、可验证的任务。主动识别遗漏、边界条件和风险，输出范围、验收标准与待确认问题。除非明确分配，否则不要直接修改交付物。",
-    enabled: false,
-  },
-  {
     id: "solution",
-    name: "甄架构",
+    name: "Codex",
     description: "设计实现方案、拆分协作步骤并评估关键风险。",
     runtime: "codex",
-    systemPrompt: "你负责把已确认的目标转化为可靠方案。分析现状、约束、模块边界、依赖关系和风险，给出分阶段、可验证的执行计划。除非明确分配，否则不要直接修改交付物。",
+    systemPrompt: "你负责把已确认的目标转化为可靠方案。分析现状、约束、模块边界、依赖关系和风险，给出分阶段、可验证的执行计划。",
     enabled: false,
   },
   {
     id: "implementation",
-    name: "蔡一平",
+    name: "CodeBuddy",
     description: "执行已确认的方案，修改交付物并完成必要验证。",
-    runtime: "claude-code",
+    runtime: "codebuddy",
     systemPrompt: "你负责执行已确认的任务。先理解上下文和验收标准，再以最小、可回滚的改动完成工作，并运行合适的检查验证结果。清楚报告改动、验证结果和遗留风险。",
     enabled: false,
   },
   {
     id: "verification",
-    name: "田小坑",
-    description: "验证结果、发现回归并反馈剩余风险。",
-    runtime: "codebuddy",
-    systemPrompt: "你负责验证交付结果。根据目标和验收标准检查行为、边界情况和回归风险，优先复现问题并给出清晰证据。除非明确分配，否则不要修改交付物。",
+    name: "DeepSeek-Harness",
+    runtime: "dsh",
+    systemPrompt: "身份与人设以你自身的系统配置为准，此处不另行设定；按本轮协作规则处理任务并回复。",
+    model: { preferredModelId: "[\"workbuddy-cn\",\"deepseek-v4.1-flash\"]", runtimeKind: "dsh" },
     enabled: false,
   },
 ];
@@ -49,7 +41,7 @@ export const AGENT_TEAM_TEMPLATES: AgentTeamTemplate[] = [
   {
     id: "software-development",
     name: "软件开发团队",
-    description: "范同经梳理需求，甄架构设计方案，蔡一平编码实现，田小坑验证质量，形成完整的软件开发协作闭环。",
+    description: "Codex 设计方案，CodeBuddy 编码实现，DeepSeek-Harness 验证质量，形成完整的软件开发协作闭环。",
     members: DEFAULT_AGENT_CONFIGS.map(({ enabled: _enabled, ...member }) => member),
   },
 ];
@@ -99,6 +91,13 @@ export function validateAgentConfigs(configs: AgentConfig[]): string[] {
             errors.push(`Agent "${configId}" model.preferredModelId must be a non-empty string.`);
           } else if (model.preferredModelId.length > 128) {
             errors.push(`Agent "${configId}" model.preferredModelId must be at most 128 characters.`);
+          }
+        }
+        if (model.preferredReasoningValue !== undefined) {
+          if (typeof model.preferredReasoningValue !== "string" || !model.preferredReasoningValue.trim()) {
+            errors.push(`Agent "${configId}" model.preferredReasoningValue must be a non-empty string.`);
+          } else if (model.preferredReasoningValue.length > 128) {
+            errors.push(`Agent "${configId}" model.preferredReasoningValue must be at most 128 characters.`);
           }
         }
       }

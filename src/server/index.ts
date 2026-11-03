@@ -182,11 +182,26 @@ async function probeConfiguredAgentModels(
         const storageKey = isSupervisor ? supervisorStorageKey(targetConversationId!) : target.id;
         const previous = existing[storageKey];
         const hasSessionValue = previous?.runtimeKind === runtimeKind && previous.currentValueSource === "session";
+        // 探针只是预览（Dot 0055 合同）：已有会话确认状态时，探针写回不得
+        // 覆盖会话已确认的思考强度当前值，也不得把变体快照降级回基础
+        // 模型形态——两处都与 currentValue 一样以会话值为准（复核 P1/P2）。
+        const reasoning = hasSessionValue && previous.reasoning && snapshot.reasoning?.configId === previous.reasoning.configId
+          ? { ...snapshot.reasoning, currentValue: previous.reasoning.currentValue, currentValueSource: "session" as const }
+          : hasSessionValue && previous.reasoning && !snapshot.reasoning
+            ? previous.reasoning
+            : snapshot.reasoning;
+        const keepVariant = hasSessionValue &&
+          previous.modelApplyPath === "session_model" &&
+          snapshot.modelApplyPath !== "session_model";
         const targetSnapshot = {
           ...snapshot,
           agentId: target.id,
           currentValue: hasSessionValue ? previous.currentValue : undefined,
           currentValueSource: hasSessionValue ? "session" as const : "probe" as const,
+          ...(reasoning ? { reasoning } : {}),
+          ...(keepVariant
+            ? { choices: previous.choices, configId: previous.configId, modelApplyPath: "session_model" as const }
+            : {}),
         };
         agentModelStateStore.update(workspaceId, targetSnapshot, storageKey);
         sseHub.publish({
@@ -709,14 +724,14 @@ runAttachmentDraftCleanup();
 function parseSupervisorConfig(input: { runtime?: unknown; model?: unknown }):
   { config: SupervisorConfig } | { error: string } {
   if (!isAgentRuntimeKind(input.runtime)) {
-    return { error: "监工运行时必须是 claude-code、codex 或 codebuddy。" };
+    return { error: "监工运行时必须是 claude-code、codex、codebuddy、dsh 或 workbuddy。" };
   }
   const runtime = input.runtime;
   if (input.model === undefined || input.model === null) return { config: { runtime } };
   if (typeof input.model !== "object" || Array.isArray(input.model)) {
     return { error: "监工模型配置格式不正确。" };
   }
-  const model = input.model as { preferredModelId?: unknown; runtimeKind?: unknown };
+  const model = input.model as { preferredModelId?: unknown; preferredReasoningValue?: unknown; runtimeKind?: unknown };
   if (model.runtimeKind !== undefined && !isAgentRuntimeKind(model.runtimeKind)) {
     return { error: "监工模型配置格式不正确。" };
   }
@@ -725,17 +740,32 @@ function parseSupervisorConfig(input: { runtime?: unknown; model?: unknown }):
     && typeof model.preferredModelId !== "string") {
     return { error: "监工模型配置格式不正确。" };
   }
+  if (model.preferredReasoningValue !== undefined
+    && model.preferredReasoningValue !== null
+    && typeof model.preferredReasoningValue !== "string") {
+    return { error: "监工模型配置格式不正确。" };
+  }
   const preferredModelId = typeof model.preferredModelId === "string"
     ? model.preferredModelId.trim()
     : "";
   if (preferredModelId.length > 512) {
     return { error: "监工模型标识过长。" };
   }
-  if (!preferredModelId) return { config: { runtime } };
+  const preferredReasoningValue = typeof model.preferredReasoningValue === "string"
+    ? model.preferredReasoningValue.trim()
+    : "";
+  if (preferredReasoningValue.length > 512) {
+    return { error: "监工思考强度标识过长。" };
+  }
+  if (!preferredModelId && !preferredReasoningValue) return { config: { runtime } };
   return {
     config: {
       runtime,
-      model: { preferredModelId, runtimeKind: isAgentRuntimeKind(model.runtimeKind) ? model.runtimeKind : runtime },
+      model: {
+        ...(preferredModelId ? { preferredModelId } : {}),
+        ...(preferredReasoningValue ? { preferredReasoningValue } : {}),
+        runtimeKind: isAgentRuntimeKind(model.runtimeKind) ? model.runtimeKind : runtime,
+      },
     },
   };
 }

@@ -37,7 +37,7 @@ test("software-development preset is the digital-worker team preset", () => {
   assert.equal(dev.name, "软件开发团队");
   assert.equal(
     dev.description,
-    "预置范同经（梳理需求）、甄架构（设计方案）、蔡一平（编码实现）、田小坑（验证质量）四个数字员工",
+    "预置 Codex（设计方案）、CodeBuddy（编码实现）、DeepSeek-Harness（验证质量）三个数字员工",
   );
   assert.equal(dev.teamId, "software-development", "preset id should align with the team template id");
   assert.equal(dev.systemPrompt, "", "interaction mode behavior must not live in the editable workspace prompt");

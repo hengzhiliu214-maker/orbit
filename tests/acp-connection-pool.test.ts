@@ -13,12 +13,13 @@ const definition: AcpRuntimeDefinition = {
   buildCommand: () => ({ file: "codebuddy", args: ["--acp"] }),
 };
 
-function fakeFactory() {
+function fakeFactory(options: { withSetModel?: boolean } = {}) {
   let spawnCount = 0;
   let initializeCount = 0;
   let closeCount = 0;
   let destroyCount = 0;
   const connections: AcpReusableConnection[] = [];
+  const setModelCalls: string[] = [];
   const factory: AcpReusableConnectionFactory = () => {
     spawnCount += 1;
     let alive = true;
@@ -32,6 +33,13 @@ function fakeFactory() {
       async loadSession() { return {}; },
       async resumeSession() { return {}; },
       async setConfigOption() { return { configOptions: [] }; },
+      ...(options.withSetModel
+        ? {
+            async setModel(request: { sessionId: string; modelId: string }) {
+              setModelCalls.push(`${request.sessionId}:${request.modelId}`);
+            },
+          }
+        : {}),
       async prompt() { return { stopReason: "end_turn" }; },
       async cancel() {},
       close() { alive = false; closeCount += 1; },
@@ -45,6 +53,7 @@ function fakeFactory() {
   };
   return {
     factory,
+    setModelCalls,
     stats: () => ({ spawnCount, initializeCount, closeCount, destroyCount }),
     // 模拟 stdout EOF：进程标志位仍活，但传输已断（issue #141 的 isAlive 语义）。
     endTransports: () => {
@@ -78,6 +87,24 @@ test("ACP pool reuses an initialized process and loaded session before TTL", asy
   assert.deepEqual(fake.stats(), { spawnCount: 1, initializeCount: 1, closeCount: 0, destroyCount: 0 });
   second.close();
   pool.dispose();
+});
+
+test("ACP pool forwards setModel only when the underlying connection implements it", async () => {
+  const withModel = fakeFactory({ withSetModel: true });
+  const poolA = new AcpConnectionPool(withModel.factory, { ttlMs: 1_000 });
+  const leased = poolA.acquire(definition, runOptions(), () => {});
+  assert.equal(typeof leased.setModel, "function");
+  await leased.setModel!({ sessionId: "session-1", modelId: "gpt-5.6-terra[high]" });
+  assert.deepEqual(withModel.setModelCalls, ["session-1:gpt-5.6-terra[high]"]);
+  leased.close();
+  poolA.dispose();
+
+  const without = fakeFactory();
+  const poolB = new AcpConnectionPool(without.factory, { ttlMs: 1_000 });
+  const plain = poolB.acquire(definition, runOptions(), () => {});
+  assert.equal(plain.setModel, undefined, "底层没有 setModel 时包装层不得凭空造出");
+  plain.close();
+  poolB.dispose();
 });
 
 test("ACP pool isolates conversations and destroys failed leases", () => {

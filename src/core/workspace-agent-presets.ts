@@ -2,7 +2,8 @@ import type { AgentConfig, AgentRuntimeKind, RuntimeAvailability } from "../shar
 import { AGENT_TEAM_TEMPLATES } from "./agent-config-store.ts";
 import { AGENT_RUNTIME_PRIORITY, runtimeKindToCliKey } from "./runtime-meta.ts";
 
-const FALLBACK_RUNTIME: AgentRuntimeKind = "claude-code";
+// 与 AGENT_RUNTIME_PRIORITY 的首选保持一致：没有任何可用运行时时的最终回落。
+const FALLBACK_RUNTIME: AgentRuntimeKind = "codex";
 
 export function preferredRuntimeFromAvailability(availability: readonly RuntimeAvailability[]): AgentRuntimeKind {
   // RuntimeAvailability.runtime holds executable keys ("claude-agent-acp", "codex-acp", "codebuddy"),
@@ -37,8 +38,11 @@ export function distributeRuntimesFromAvailability(
  * 返回按工作区模板预置的数字员工配置。
  *
  * 工作区模板即"数字员工团队预置模板"：模板 id 与 AGENT_TEAM_TEMPLATES 的团队 id 对齐。
- * - 命中团队模板 → 返回该团队全部成员并启用；传入 availability 时按本地实际可用的运行时
- *   轮流分配（尽量让成员使用不同的运行时），未传入则保留模板自带 runtime；
+ * - 命中团队模板 → 返回该团队全部成员并启用；成员自带的 runtime 是模板声明的一部分，
+ *   传入 availability 时只要该 runtime 本地可用就保留它（保证模板声明的席位构成
+ *   在新工作区原样出生）；只有成员 runtime 不可用时，才按本地可用运行时轮流
+ *   分配的结果回落（见 distributeRuntimesFromAvailability），未传入 availability
+ *   则保留模板自带 runtime；
  * - 未命中（如空白工作区）→ 返回 null，表示不预置任何数字员工。
  */
 export function initialAgentConfigsForWorkspacePreset(
@@ -50,6 +54,15 @@ export function initialAgentConfigsForWorkspacePreset(
   if (!availability) {
     return template.members.map((member) => ({ ...member, enabled: true }));
   }
-  const runtimes = distributeRuntimesFromAvailability(template.members.length, availability);
-  return template.members.map((member, index) => ({ ...member, enabled: true, runtime: runtimes[index] }));
+  const availableCliKeys = new Set(
+    availability.filter((item) => item.available).map((item) => item.runtime),
+  );
+  const distributed = distributeRuntimesFromAvailability(template.members.length, availability);
+  return template.members.map((member, index) => ({
+    ...member,
+    enabled: true,
+    runtime: availableCliKeys.has(runtimeKindToCliKey(member.runtime))
+      ? member.runtime
+      : distributed[index],
+  }));
 }

@@ -80,12 +80,12 @@ export type PendingPermission = AgentPermissionRequest & {
   expiresAt: string;
 };
 
-export type AgentRuntimeKind = "claude-code" | "codex" | "codebuddy";
+export type AgentRuntimeKind = "claude-code" | "codex" | "codebuddy" | "dsh" | "workbuddy";
 
-export const AGENT_RUNTIME_KINDS: readonly AgentRuntimeKind[] = ["claude-code", "codex", "codebuddy"];
+export const AGENT_RUNTIME_KINDS: readonly AgentRuntimeKind[] = ["claude-code", "codex", "codebuddy", "dsh", "workbuddy"];
 
 export function isAgentRuntimeKind(value: unknown): value is AgentRuntimeKind {
-  return value === "claude-code" || value === "codex" || value === "codebuddy";
+  return value === "claude-code" || value === "codex" || value === "codebuddy" || value === "dsh" || value === "workbuddy";
 }
 
 export type ChannelWatchTriggers = {
@@ -114,6 +114,8 @@ export function hasActiveChannelWatchTriggers(triggers?: ChannelWatchTriggers): 
  */
 export type AgentModelPreference = {
   preferredModelId?: string;
+  /** 思考强度偏好：runtime 会话配置项（如 thought_level）里的 value ID，原样保存、不做跨 runtime 转换。缺省为跟随运行时默认。 */
+  preferredReasoningValue?: string;
   runtimeKind: AgentRuntimeKind;
 };
 
@@ -156,6 +158,8 @@ export type AgentProfile = {
   triggers?: ChannelWatchTriggers;
   /** 已按 runtime 匹配门控的首选模型 ID（issue #142）；运行开始时惰性应用。 */
   preferredModelId?: string;
+  /** 已按 runtime 匹配门控的首选思考强度；运行开始时在模型之后惰性应用。 */
+  preferredReasoningValue?: string;
   internal?: boolean;
 };
 
@@ -170,6 +174,21 @@ export type AgentModelChoice = {
  * 都会返回 config options；Orbit 抽取其中 category 为 "model" 的 select 选项
  * 生成本快照。choices 为空表示该 runtime 不提供模型选择。
  */
+/**
+ * 员工 runtime 会话的思考强度配置快照。只对已核实提供标准思考强度配置项的
+ * runtime 产生（CodeBuddy 的 thought_level、dsh 的 reasoning_effort）；choices
+ * 与 currentValue 均为 runtime 原样上报，不做同义转换。
+ */
+export type AgentReasoningStateSnapshot = {
+  /** 思考强度选项在 ACP config options 里的 configId（如 "thought_level"）。 */
+  configId: string;
+  choices: AgentModelChoice[];
+  currentValue: string | undefined;
+  /** currentValue 是否来自真实员工会话；探测会话只提供可选列表。 */
+  currentValueSource?: "probe" | "session";
+  updatedAt: string;
+};
+
 export type AgentModelStateSnapshot = {
   agentId: AgentId;
   runtimeKind: AgentRuntimeKind;
@@ -179,6 +198,15 @@ export type AgentModelStateSnapshot = {
   currentValue: string | undefined;
   /** currentValue 是否来自真实员工会话；探测会话只提供可选列表。 */
   currentValueSource?: "probe" | "session";
+  /** 思考强度快照（仅已核实提供该配置项的 runtime 附带）。 */
+  reasoning?: AgentReasoningStateSnapshot;
+  /**
+   * 模型下发路径。缺省（undefined）为 config_option：经 session config 的
+   * model 选项下发；"session_model" 表示 choices 是带思考强度的变体
+   * modelId（如 Codex 的 gpt-5.6-terra[high]），只能经 legacy
+   * session/set_model 下发，两条路径不得混用或互相覆盖。
+   */
+  modelApplyPath?: "config_option" | "session_model";
   updatedAt: string;
 };
 

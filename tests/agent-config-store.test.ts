@@ -30,7 +30,6 @@ function config(overrides: Partial<AgentConfig> = {}): AgentConfig {
 
 test("defaults provide a disabled software development team", () => {
   assert.deepEqual(DEFAULT_AGENT_CONFIGS.map((item) => item.id), [
-    "requirements",
     "solution",
     "implementation",
     "verification",
@@ -38,6 +37,22 @@ test("defaults provide a disabled software development team", () => {
   assert.ok(DEFAULT_AGENT_CONFIGS.every((item) => !item.enabled));
   assert.ok(DEFAULT_AGENT_CONFIGS.every((item) => item.name.length > 0 && item.systemPrompt.length > 0));
   assert.ok(DEFAULT_AGENT_CONFIGS.every((item) => !("role" in item) && !("ui" in item)));
+});
+
+test("defaults match the aligned three-seat standard", () => {
+  const byId = new Map(DEFAULT_AGENT_CONFIGS.map((item) => [item.id, item]));
+  assert.deepEqual(DEFAULT_AGENT_CONFIGS.map((item) => item.name), ["Codex", "CodeBuddy", "DeepSeek-Harness"]);
+  assert.ok(DEFAULT_AGENT_CONFIGS.every((item) => item.runtime !== "claude-code" && item.runtime !== "workbuddy"));
+  const codex = byId.get("solution");
+  assert.equal(codex?.runtime, "codex");
+  assert.ok(!codex?.systemPrompt.includes("除非明确分配"), "codex prompt must not carry the removed restriction sentence");
+  const codebuddy = byId.get("implementation");
+  assert.equal(codebuddy?.runtime, "codebuddy");
+  const dsh = byId.get("verification");
+  assert.equal(dsh?.runtime, "dsh");
+  assert.equal(dsh?.description, undefined, "dsh seat carries no description");
+  assert.equal(dsh?.systemPrompt, "身份与人设以你自身的系统配置为准，此处不另行设定；按本轮协作规则处理任务并回复。");
+  assert.deepEqual(dsh?.model, { preferredModelId: "[\"workbuddy-cn\",\"deepseek-v4.1-flash\"]", runtimeKind: "dsh" });
 });
 
 test("software development team template contains the default members", () => {
@@ -116,6 +131,30 @@ test("model preference round-trips through the store", () => {
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("reasoning preference round-trips and validates like the model preference", () => {
+  const dir = tempDir();
+  try {
+    const store = new AgentConfigStore(dir);
+    const configs = [config({ name: "助手", model: { preferredReasoningValue: "high", runtimeKind: "codebuddy" } })];
+    store.save("ws1", configs);
+    assert.deepEqual(store.load("ws1"), configs);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  assert.deepEqual(
+    validateAgentConfigs([config({ name: "助手", model: { preferredReasoningValue: "high", runtimeKind: "codebuddy" } })]),
+    [],
+  );
+  assert.ok(
+    validateAgentConfigs([config({ name: "助手", model: { preferredReasoningValue: "", runtimeKind: "codebuddy" } })])
+      .some((error) => error.includes("model.preferredReasoningValue")),
+  );
+  assert.ok(
+    validateAgentConfigs([config({ name: "助手", model: { preferredReasoningValue: "x".repeat(129), runtimeKind: "dsh" } })])
+      .some((error) => error.includes("at most 128")),
+  );
 });
 
 test("model preference validation rejects malformed entries", () => {
