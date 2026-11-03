@@ -250,3 +250,22 @@ test("custom teams receive all built-in mode rules without workspace instruction
   assert.ok(supervised.includes("decompose, schedule, track progress, recover from failures, and drive the task to closure"));
   assert.match(supervised, /Before delegating, identify dependencies between tasks/);
 });
+
+test("dsh employee identity defers to its own system configuration", () => {
+  const dshProfile: AgentProfile = {
+    id: "deep",
+    name: "DeepSeek-Harness",
+    runtime: "dsh",
+    cwd: "D:/project",
+    systemPrompt: "defer",
+  };
+  const output = buildAgentContext({
+    agentId: "deep",
+    profiles: [dshProfile],
+    agentMessage: "@DeepSeek-Harness: hello",
+    interactionMode: "direct",
+  });
+  assert.ok(output.includes("Current agent: DeepSeek-Harness"));
+  assert.ok(output.includes("defined by your own system configuration"));
+  assert.ok(!output.includes("configurable digital employee"));
+});

@@ -38,10 +38,15 @@ function escapeDynamicContent(text: string): string {
 // ---------------------------------------------------------------------------
 
 function renderIdentitySection(profile: AgentProfile | undefined, agentId: AgentId): string {
+  // dsh 运行时的人设由其自身系统配置定义；这里只给路由标签，不另行设定身份。
+  const identityLine =
+    profile?.runtime === "dsh"
+      ? "Identity: defined by your own system configuration. The name above is only your routing label in this workspace, not your identity."
+      : "Identity: a configurable digital employee with a specific task instruction.";
   return [
     "<identity>",
     `Current agent: ${profile?.name ?? agentId}`,
-    "Identity: a configurable digital employee with a specific task instruction.",
+    identityLine,
     "</identity>",
   ].join("\n");
 }
