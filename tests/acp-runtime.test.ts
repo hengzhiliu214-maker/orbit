@@ -13,6 +13,7 @@ import type {
 
 import {
   CANCEL_GRACE_MS,
+  isCrossGenerationRestore,
   legacyModelStateOf,
   probeAcpCommands,
   probeAcpModelState,
@@ -58,6 +59,11 @@ type FakeConnectionControls = {
   sessionModels?: unknown;
   setModelError?: Error;
   omitSetModel?: boolean;
+  /** Dot 0094：假连接的世代信息。connectionGeneration 取 spawn 序号；
+   * sessionOriginGeneration 是测试声明的「会话由哪个世代创建」，缺省为
+   * undefined（本进程查不到来源 = 跨世代，与磁盘恢复绑定的真实情形同形）。 */
+  sessionOriginGeneration?: number;
+  omitGenerationInfo?: boolean;
 };
 
 function fakeConnector(controls: FakeConnectionControls = {}) {
@@ -78,6 +84,8 @@ function fakeConnector(controls: FakeConnectionControls = {}) {
     notifySessionUpdate = notify;
     const connection: AcpConnection = {
       pid: 4242,
+      connectionGeneration: connectionSpawn,
+      sessionGeneration: (_sessionId: string) => controls.sessionOriginGeneration,
       initialize() {
         calls.push("initialize");
         return controls.hangInitialize
@@ -156,6 +164,10 @@ function fakeConnector(controls: FakeConnectionControls = {}) {
       },
     };
     if (controls.omitSetModel) delete connection.setModel;
+    if (controls.omitGenerationInfo) {
+      delete connection.connectionGeneration;
+      delete connection.sessionGeneration;
+    }
     return connection;
   };
   return {
@@ -568,6 +580,7 @@ test("an unrecoverable resume failure falls back to a fresh session", async () =
   assert.equal(fake.spawnCount, 1, "不可恢复降级不换连接");
   assert.ok(notices.some((text) => text.includes("已重建新会话")), `expected persisted downgrade notice in: ${notices.join(" | ")}`);
   assert.ok(notices.some((text) => text.includes("thread-store conflict")), `expected failure summary in: ${notices.join(" | ")}`);
+  assert.ok(notices.some((text) => text.includes("不保证上下文完整")), `expected honest history caveat in: ${notices.join(" | ")}`);
 });
 
 test("an opaque internal-error resume failure retries the same session on a fresh connection", async () => {
@@ -601,11 +614,13 @@ test("an opaque internal-error resume failure retries the same session on a fres
 });
 
 test("an opaque internal error rejected on both connections downgrades with a persisted notice", async () => {
-  // 同一绑定在两条连接上被同类错误接连拒绝，才构成「原会话确已失效」的
-  // 实据（含 2026-11-03 实测的 dsh 跨进程场景：每个新进程都不认识旧会话，
-  // 必然连续拒绝）——此时按不可恢复降级新建会话，且提示必须走过程叙述
-  // 流在持久时间线留痕。新会话收到的 prompt 与全新会话完全相同（同一份
-  // options.prompt），上下文组装不因降级而缺失。
+  // 跨世代 + 同一绑定在两条连接上被同类错误接连拒绝，才构成「原会话确
+  // 已失效」的实据（Dot 0094；含 2026-11-03 实测的 dsh 跨进程场景：绑定
+  // 从磁盘恢复、创建进程已不存在，假连接的来源世代缺省为查不到，与该
+  // 情形同形）——此时降级新建会话，提示走过程叙述流在持久时间线留痕，
+  // 且必须如实说明历史可能被截断、不保证上下文完整，不得再声称「仅运
+  // 行时内部状态重置」。新会话收到的 prompt 与全新会话完全相同（同一
+  // 份 options.prompt）。
   const notices: string[] = [];
   const fake = fakeConnector({
     resumeCapability: true,
@@ -632,6 +647,59 @@ test("an opaque internal error rejected on both connections downgrades with a pe
   assert.deepEqual(fake.prompts.length, 1, "降级后只发送本轮同一份 prompt");
   assert.ok(notices.some((text) => text.includes("已重建新会话")), `expected persisted downgrade notice in: ${notices.join(" | ")}`);
   assert.ok(notices.some((text) => text.includes("Internal error")), `expected failure summary in: ${notices.join(" | ")}`);
+  assert.ok(notices.some((text) => text.includes("不保证上下文完整")), `expected honest history caveat in: ${notices.join(" | ")}`);
+  assert.ok(!notices.some((text) => text.includes("仅运行时内部状态重置")), "旧文案不得再承诺上下文完整");
+});
+
+test("same-generation double internal errors do not downgrade (Dot 0094)", async () => {
+  // 会话由当前连接的进程世代创建（来源世代 = 第一条连接的世代）：同一
+  // 世代内连续两次 -32603 更可能是持续服务故障，不能证明会话失效。
+  // 必须保留原绑定、本轮按普通失败落定，不重绑新会话。
+  const fake = fakeConnector({
+    resumeCapability: true,
+    resumeError: Object.assign(new Error("Internal error"), { code: -32603 }),
+    secondResumeError: Object.assign(new Error("Internal error"), { code: -32603 }),
+    sessionOriginGeneration: 1,
+  });
+  const handle = runAcp(
+    runOptions({ resumeSessionId: "old-session" }),
+    definition,
+    fake.connector,
+  );
+
+  await assert.rejects(handle.result, (error: unknown) => {
+    assert.match((error as Error).message, /Internal error/);
+    return true;
+  });
+  assert.equal(fake.spawnCount, 2, "仍只允许换连接重试一次");
+  assert.ok(!fake.calls.some((call) => call.startsWith("session/new:")), "同世代双 -32603 不得降级新建会话");
+});
+
+test("undeterminable generation treats double internal errors conservatively (Dot 0094)", async () => {
+  // 连接不提供世代信息时无法证明跨世代：采用保守口径，保留原绑定、
+  // 按普通错误落定，不假装能判定而降级。
+  const fake = fakeConnector({
+    resumeCapability: true,
+    resumeError: Object.assign(new Error("Internal error"), { code: -32603 }),
+    secondResumeError: Object.assign(new Error("Internal error"), { code: -32603 }),
+    omitGenerationInfo: true,
+  });
+  const handle = runAcp(
+    runOptions({ resumeSessionId: "old-session" }),
+    definition,
+    fake.connector,
+  );
+
+  await assert.rejects(handle.result, /Internal error/);
+  assert.ok(!fake.calls.some((call) => call.startsWith("session/new:")), "世代不可判定不得降级新建会话");
+});
+
+test("isCrossGenerationRestore classifies generation relations", () => {
+  const stub = (fields: Partial<AcpConnection>): AcpConnection => fields as AcpConnection;
+  assert.equal(isCrossGenerationRestore(stub({ connectionGeneration: 2, sessionGeneration: () => 1 }), "s"), true, "创建世代不同 = 跨世代");
+  assert.equal(isCrossGenerationRestore(stub({ connectionGeneration: 2, sessionGeneration: () => undefined }), "s"), true, "查不到创建世代 = 创建进程已不在本进程内");
+  assert.equal(isCrossGenerationRestore(stub({ connectionGeneration: 1, sessionGeneration: () => 1 }), "s"), false, "同世代");
+  assert.equal(isCrossGenerationRestore(stub({}), "s"), null, "无世代信息 = 不可判定");
 });
 
 test("an opaque internal error followed by an unrelated retry failure settles as a normal error", async () => {

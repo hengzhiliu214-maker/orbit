@@ -80,6 +80,15 @@ export type AcpConnection = {
   prompt(request: PromptRequest): Promise<PromptResponse>;
   cancel(sessionId: string): Promise<void>;
   hasSession?(sessionId: string): boolean;
+  /**
+   * 可选：连接世代信息（Dot 0094）。connectionGeneration 是本连接（底层
+   * agent 进程）在连接池内的世代序号；sessionGeneration 返回某会话由
+   * 哪个世代的连接创建/持有，查不到表示该会话创建于本进程启动之前
+   * （绑定从磁盘恢复、创建进程已不存在）。非池化连接可不提供，此时
+   * 世代关系不可判定，恢复分类按保守口径处理。
+   */
+  connectionGeneration?: number;
+  sessionGeneration?(sessionId: string): number | undefined;
   close(): void;
   destroy?(): void;
 };
@@ -676,9 +685,10 @@ export type AcpSessionRestoreClassification = "recoverable" | "unrecoverable" | 
  * 明确报告的会话状态冲突或损坏归为不可恢复；传输断开、网络超时、进程退出
  * 归为可恢复（会话本身仍有效，换一条连接即可）。泛化内部错误（JSON-RPC
  * -32603 / "internal error"）不带会话状态细节，单次出现不足以证明原会话
- * 已失效，归为「证据不足」：先在新连接上重试同一绑定，只有同一绑定被同类
- * 错误再次拒绝才构成失效实据（见 restoreOrRecoverSession）。识别不了的
- * 一律返回 null，按普通错误落定，不自动降级。
+ * 已失效，归为「证据不足」：先在新连接上重试同一绑定；按 Dot 0094 的
+ * 收窄，还须证明恢复发生在与创建该会话不同的进程/连接世代，两次同类
+ * 拒绝才构成失效实据（见 restoreOrRecoverSession）。识别不了的一律
+ * 返回 null，按普通错误落定，不自动降级。
  */
 export function classifySessionRestoreError(error: unknown): AcpSessionRestoreClassification | null {
   const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
@@ -698,6 +708,23 @@ export function classifySessionRestoreError(error: unknown): AcpSessionRestoreCl
   return null;
 }
 
+/**
+ * 世代判定（Dot 0094）：本次恢复尝试是否发生在与创建该会话不同的进程/
+ * 连接世代。返回 true = 跨世代（创建会话的进程已不存在：绑定从磁盘恢复
+ * 且本进程内查不到创建世代，或创建世代与当前连接世代不同）——进程内
+ * 内存态的旧会话在新进程里必然不存在，拒绝即构成失效证据。返回 false
+ * = 同世代（创建会话的正是当前连接的进程，它却以泛化内部错误拒绝恢复
+ * 自己的会话，更可能是持续服务故障）。连接不提供世代信息时返回 null
+ * （不可判定），调用方按保守口径处理，不据此降级。
+ */
+export function isCrossGenerationRestore(connection: AcpConnection, sessionId: string): boolean | null {
+  const generation = connection.connectionGeneration;
+  if (typeof generation !== "number") return null;
+  const origin = connection.sessionGeneration?.(sessionId);
+  if (origin === undefined) return true;
+  return origin !== generation;
+}
+
 function summarizeRestoreFailure(error: unknown): string {
   const firstLine = (error instanceof Error ? error.message : String(error)).split("\n")[0]!.trim();
   return firstLine.length > 120 ? `${firstLine.slice(0, 117)}…` : firstLine;
@@ -708,13 +735,19 @@ function summarizeRestoreFailure(error: unknown): string {
  * - 不可恢复（会话状态冲突或损坏，有明确实据）：直接新建会话降级；
  * - 可恢复（传输断开/超时/进程退出）与证据不足（泛化内部错误）：都先销毁
  *   当前 lease，用新连接和同一个 sessionId 重试一次。可恢复路径重试再
- *   失败按普通错误落定；证据不足路径只有同一绑定在新连接上被同类错误
- *   （证据不足或不可恢复）再次拒绝，才构成「原会话确已失效」的实据，
- *   按不可恢复降级；重试以其他方式失败一律按普通错误落定，保留原绑定，
- *   由主人下一条消息决定，不擅自换会话。
+ *   失败按普通错误落定；证据不足路径的降级还须满足 Dot 0094 的世代
+ *   条件：两次泛化内部错误本身不能证明会话失效（可能只是持续服务
+ *   故障）——只有当恢复尝试发生在与创建该会话不同的进程/连接世代
+ *   （isCrossGenerationRestore 为 true：创建进程已不存在，进程内内存态
+ *   的旧会话必然无处可寻），且同一绑定在新连接上再被同类错误拒绝，
+ *   才构成「原会话确已失效」的实据并降级；重试被明确报告为不可恢复
+ *   （会话状态冲突/损坏的实据）时同样降级。同世代、或世代不可判定
+ *   时一律按普通错误落定，保留原绑定并明确报错，不重绑新会话。
  * 降级新建的会话与全新会话共用同一份 options.prompt（由调用方统一经
- * buildAgentContext 组装，含会话历史注入），失去的只是 runtime 内部的
- * 会话状态；降级提示走过程叙述流持久留痕（见 downgradeToFreshSession）。
+ * buildAgentContext 组装）；但历史组装是从该 agent 最近完成消息之后
+ * 截取的，可能为空，且有单条与总量长度上限和附件限制——降级提示必须
+ * 如实说明历史可能不完整（见 downgradeToFreshSession），不得承诺
+ * 上下文完整；降级提示走过程叙述流持久留痕。
  */
 async function restoreOrRecoverSession(
   connection: AcpConnection,
@@ -762,7 +795,18 @@ async function restoreOrRecoverSession(
     } catch (retryError) {
       if (classification === "ambiguous") {
         const retryClassification = classifySessionRestoreError(retryError);
-        if (retryClassification === "ambiguous" || retryClassification === "unrecoverable") {
+        if (retryClassification === "unrecoverable") {
+          // 重试给出了会话状态冲突/损坏的明确实据：与世代无关，按实据降级。
+          return downgradeToFreshSession(replacement, options, definition, absoluteCwd, retryError);
+        }
+        if (
+          retryClassification === "ambiguous"
+          && isCrossGenerationRestore(connection, options.resumeSessionId) === true
+        ) {
+          // Dot 0094：跨世代 + 两次同类拒绝——创建会话的进程已不存在，
+          // 进程内内存态的旧会话必然失效，构成降级实据。同世代（创建
+          // 进程自己拒绝恢复）或世代不可判定（保守口径）时不降级：
+          // 落入下方普通错误，保留原绑定并明确报错。
           return downgradeToFreshSession(replacement, options, definition, absoluteCwd, retryError);
         }
       }
@@ -789,7 +833,7 @@ async function downgradeToFreshSession(
   const created = await connection.newSession({ cwd: absoluteCwd, mcpServers: [] });
   emitModelNotice(
     options,
-    `原 ${definition.displayName} 会话无法恢复（${summarizeRestoreFailure(error)}），已重建新会话继续；新会话沿用同一份上下文组装，仅运行时内部状态重置。`,
+    `原 ${definition.displayName} 会话无法恢复（${summarizeRestoreFailure(error)}），已重建新会话继续；新会话会带入按当前规则组装的近期对话历史，但这份历史是从该员工最近完成的消息之后截取的，可能为空或被截断、较早内容可能缺失，不保证上下文完整。`,
   );
   return {
     sessionId: created.sessionId,

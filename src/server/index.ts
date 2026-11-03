@@ -2197,9 +2197,10 @@ async function handlePutAgents(req: http.IncomingMessage, res: http.ServerRespon
   // modelState 是 GET 响应合并的运行时快照，保存前剥离，避免污染 agents.json。
   const configs = input.map(({ modelState: _modelState, modelProbe: _modelProbe, ...config }) => config);
   // 设置页保存防护：载荷偏好若恰好等于过期会话快照的当前值、且与库内已保存
-  // 偏好不同，拒绝保存，避免把较新的模型偏好静默盖回旧值。注意：对已有会话
-  // 确认值的员工，刷新模型列表不会把快照来源改为探测来源（探针不得覆盖会
-  // 话确认值），解开靠保存值与已保存偏好一致或改选新值，口径见 agent-model-guard.ts。
+  // 偏好不同，拒绝保存，避免把较新的模型偏好静默盖回旧值。注意：刷新模型
+  // 列表不会自动解开拦截——mergeProbedConfigs 保留本地未保存的选择；解开
+  // 靠关闭面板不保存、重开后改回已保存偏好，或改选新值（Dot 0094 口径，
+  // 详见 agent-model-guard.ts）。
   const staleOverwrite = findStaleSnapshotPreferenceOverwrite(
     configStore.load(workspaceId),
     configs,
@@ -2208,7 +2209,7 @@ async function handlePutAgents(req: http.IncomingMessage, res: http.ServerRespon
   if (staleOverwrite) {
     sendJson(res, 409, {
       ok: false,
-      message: `员工「${staleOverwrite.agentName}」的${staleOverwrite.field === "model" ? "模型" : "思考强度"}偏好已拒绝保存：提交的值与一份较早的会话记录相同，可能来自过期的模型列表，保存会覆盖较新的偏好。解开方法：让保存值与已保存偏好一致后重新保存（在设置页刷新模型列表会更新可选列表，并以已保存偏好为选中项提交），或改选一个不等于该旧记录值的新偏好。本拦截只针对这一种过期值覆盖，并非通用的并发保存保护。`,
+      message: `员工「${staleOverwrite.agentName}」的${staleOverwrite.field === "model" ? "模型" : "思考强度"}偏好已拒绝保存：提交的值与一份较早的会话记录相同，可能来自过期的模型列表，保存会覆盖较新的偏好。解开方法：关闭设置面板且不要保存，重新打开后把该员工的${staleOverwrite.field === "model" ? "模型" : "思考强度"}改回标注「已保存的首选」的那一项（重新打开时已保存偏好即为选中项）再保存，或改选一个不等于该旧记录值的新偏好。注意：点「刷新模型列表」只会更新可选列表，不会自动把已修改的选择改回已保存偏好。本拦截只针对这一种过期值覆盖（特定签名），并非通用的并发保存保护。`,
     });
     return;
   }

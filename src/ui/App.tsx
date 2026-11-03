@@ -283,6 +283,11 @@ export function App() {
           || pageContext.workspaceId !== requestedContext.workspaceId
           || pageContext.conversationId !== requestedContext.conversationId) return;
         setState(normalizeState(nextState));
+        // 结果不确定的默认接收人变更（Dot 0094）：一次成功的状态刷新即
+        // 一次重读，刷新带来的会话状态就是权威值，据此解锁确认中变更。
+        if (defaultAgentChangeTrackerRef.current.resolveConfirming(requestedContext)) {
+          setDefaultAgentChangeRenderTick((tick) => tick + 1);
+        }
       })
       .catch(() => setConnectionState("offline"));
   };
@@ -488,6 +493,14 @@ export function App() {
   // 的同步状态，不依赖渲染时序。
   const defaultAgentChangePending = useMemo(
     () => defaultAgentChangeTrackerRef.current.isChangePending({
+      workspaceId: state.workspace.id,
+      conversationId: state.conversation.id,
+    }),
+    [defaultAgentChangeRenderTick, state.workspace.id, state.conversation.id],
+  );
+  // 确认中阶段（Dot 0094）：PUT 结果不确定、正在重读确认，文案与保存中区分。
+  const defaultAgentChangeConfirming = useMemo(
+    () => defaultAgentChangeTrackerRef.current.isChangeConfirming({
       workspaceId: state.workspace.id,
       conversationId: state.conversation.id,
     }),
@@ -999,23 +1012,68 @@ export function App() {
         conversationId: pageContext.conversationId || request.conversationId,
       };
     };
+    // 结果分类（Dot 0094）：只有「成功且带回 conversation」与「4xx 且带
+    // JSON 错误体」是确定结果；网络失败、响应解析失败、5xx 或成功响应
+    // 缺少 conversation 都属于不确定——服务端可能已经提交切换，按确定
+    // 失败解锁回旧值会让界面显示旧接收人而服务器已切换、消息错发。
+    let settled = false;
     try {
       const response = await fetch(withPageContext(`/api/conversations/${conversationId}/default-agent`, currentPageContext()), {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ agentId: agentId === "" ? null : agentId }),
       });
-      const body = await response.json() as { conversation?: ConversationInfo; message?: string };
-      if (!response.ok || !body.conversation) throw new Error(body.message ?? "默认接收员工设置失败");
-      if (!tracker.finishChange(request, responseContext())) return;
-      setState((current) => ({ ...current, conversation: body.conversation! }));
-    } catch (error) {
-      // 过期的失败同样丢弃：不在已切换到的新会话里冒充本会话的错误。
-      if (!tracker.finishChange(request, responseContext())) return;
-      setState((current) => ({ ...current, messages: [...current.messages, createLocalSystemMessage(error instanceof Error ? error.message : "默认接收员工设置失败")] }));
+      let body: { conversation?: ConversationInfo; message?: string } | null = null;
+      try {
+        body = await response.json() as { conversation?: ConversationInfo; message?: string };
+      } catch {
+        body = null;
+      }
+      if (response.ok && body?.conversation) {
+        settled = true;
+        if (!tracker.finishChange(request, responseContext())) return;
+        setState((current) => ({ ...current, conversation: body.conversation! }));
+        return;
+      }
+      if (!response.ok && response.status >= 400 && response.status < 500 && body?.message) {
+        // 确定失败：解锁回旧值并提示（过期的失败同样丢弃，不在新会话冒充）。
+        settled = true;
+        if (!tracker.finishChange(request, responseContext())) return;
+        setState((current) => ({ ...current, messages: [...current.messages, createLocalSystemMessage(body?.message ?? "默认接收员工设置失败")] }));
+        return;
+      }
+    } catch {
+      // 网络失败：没有任何响应，结果不确定，走下方确认流程。
     } finally {
       setDefaultAgentChangeRenderTick((tick) => tick + 1);
     }
+    if (settled) return;
+    // 不确定路径：转入确认中阶段（继续阻断发送），用既有的状态读取路径
+    // 重读该会话，以重读到的会话状态为准解锁——重读值无论与目标一致
+    // 与否都是权威值。有限重试仍失败则保持确认态，等待后续状态刷新
+    // （refreshState 成功时同样解锁），绝不猜测结果、绝不回旧值解锁。
+    if (!tracker.markUncertain(request)) return;
+    setDefaultAgentChangeRenderTick((tick) => tick + 1);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 800));
+      try {
+        const stateResponse = await fetch(withPageContext("/api/state", { workspaceId: request.workspaceId, conversationId: request.conversationId }));
+        if (!stateResponse.ok) continue;
+        const nextState = await stateResponse.json() as AppState;
+        if (nextState.conversation?.id !== request.conversationId) continue;
+        if (!tracker.resolveWithReread(request, responseContext())) return;
+        setState(normalizeState(nextState));
+        setDefaultAgentChangeRenderTick((tick) => tick + 1);
+        return;
+      } catch {
+        // 重读失败：继续保持确认态，按有限重试再试。
+      }
+    }
+    // 重读仍未成功：保持确认态阻断发送，明确提示结果未确认。
+    if (responseContext().conversationId === request.conversationId) {
+      setState((current) => ({ ...current, messages: [...current.messages, createLocalSystemMessage("默认接收员工的设置结果未能确认（可能已保存成功）：发送已暂停，等待状态刷新确认后恢复，请勿按旧接收人继续发送。")] }));
+    }
+    setDefaultAgentChangeRenderTick((tick) => tick + 1);
   }
 
   async function resolvePermission(requestId: string, decision: PermissionDecision) {
@@ -2268,7 +2326,7 @@ export function App() {
                       <option key={agent.id} value={agent.id}>{agent.label}</option>
                     ))}
                   </select>
-                  {defaultAgentChangePending ? <span className="defaultReceiverPending">保存中…</span> : null}
+                  {defaultAgentChangePending ? <span className="defaultReceiverPending">{defaultAgentChangeConfirming ? "确认中…" : "保存中…"}</span> : null}
                 </label>
               ) : null}
               <div className="approvalModeControl">
@@ -2329,9 +2387,9 @@ export function App() {
               theme="primary"
               icon={<SendIcon />}
               disabled={!hasWorkspace || !hasEnabledAgent || !canSendMessage(content, pendingAttachments.length) || isSending || isSwitchingInteractionMode || uploadingAttachments > 0 || defaultAgentChangePending}
-              title={defaultAgentChangePending ? "接收人保存中，完成后可发送" : uploadingAttachments > 0 ? "附件上传中，完成后可发送" : undefined}
+              title={defaultAgentChangePending ? (defaultAgentChangeConfirming ? "接收人结果确认中，完成后可发送" : "接收人保存中，完成后可发送") : uploadingAttachments > 0 ? "附件上传中，完成后可发送" : undefined}
             >
-              {isSending ? <span className="sendSpinner" aria-hidden="true" /> : uploadingAttachments > 0 ? "上传中…" : defaultAgentChangePending ? "保存中…" : "发送"}
+              {isSending ? <span className="sendSpinner" aria-hidden="true" /> : uploadingAttachments > 0 ? "上传中…" : defaultAgentChangePending ? (defaultAgentChangeConfirming ? "确认中…" : "保存中…") : "发送"}
             </Button>
             </div>
           </div>
