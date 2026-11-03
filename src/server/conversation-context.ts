@@ -1,6 +1,5 @@
 import path from "node:path";
 
-import type { RecoveryPrompt } from "../core/agent-runtime.ts";
 import { AgentRegistry } from "../core/agent-registry.ts";
 import { buildAgentContext } from "../core/agent-context-builder.ts";
 import { buildHistoryForAgent, SUPERVISOR_HISTORY_TURNS } from "../core/agent-history-builder.ts";
@@ -36,7 +35,7 @@ const MAX_ROUTE_DEPTH = 10;
 export type ConversationContextPatch = {
   interactionMode?: InteractionMode;
   supervisorConfig?: SupervisorConfig | null;
-  lastDirectAgentId?: AgentId;
+  lastDirectAgentId?: AgentId | null;
 };
 
 export type ConversationContextOptions = {
@@ -52,8 +51,13 @@ export type ConversationContextOptions = {
   /** 监工的运行时与模型偏好（issue #153）。旧字段 supervisionRuntime 由存储层映射而来。 */
   supervisorConfig?: SupervisorConfig;
   lastDirectAgentId?: AgentId;
-  /** 会话记录变更回调（如普通对话目标员工变化），由服务层负责持久化。 */
-  onConversationPatch?: (patch: ConversationContextPatch) => void;
+  /**
+   * 会话记录变更回调（如普通对话目标员工变化），由服务层负责持久化。
+   * 返回 false 表示持久化失败：只有显式设置默认接收人的路径据此回滚
+   * 并报错（setDefaultDirectAgent），其余调用方忽略返回值——持久化
+   * 失败不阻断路由等既有流程的口径不变。返回 void 视为已受理。
+   */
+  onConversationPatch?: (patch: ConversationContextPatch) => boolean | void;
   /** 模型快照桥（issue #142）：读写 workspace 级员工模型状态。 */
   modelState?: AgentModelStateBridge;
 };
@@ -132,8 +136,6 @@ export class ConversationContext {
       eventBus,
       buildPrompt: (agentId, prompt, sourceMessageId, sourceAttachments, interactionMode) =>
         self.buildRuntimePrompt(agentId, prompt, sourceMessageId, sourceAttachments, interactionMode),
-      buildRecoveryPrompt: (agentId, prompt, sourceMessageId, sourceAttachments, interactionMode) =>
-        self.buildRuntimePromptContext(agentId, prompt, sourceMessageId, sourceAttachments, interactionMode, true),
       onRunCompleted: (message) => {
         self.messageRouter.process(message);
       },
@@ -233,8 +235,6 @@ export class ConversationContext {
       eventBus,
       buildPrompt: (agentId, prompt, sourceMessageId, sourceAttachments, interactionMode) =>
         self.buildRuntimePrompt(agentId, prompt, sourceMessageId, sourceAttachments, interactionMode),
-      buildRecoveryPrompt: (agentId, prompt, sourceMessageId, sourceAttachments, interactionMode) =>
-        self.buildRuntimePromptContext(agentId, prompt, sourceMessageId, sourceAttachments, interactionMode, true),
       onRunCompleted: (message) => {
         self.messageRouter.process(message);
       },
@@ -324,6 +324,10 @@ export class ConversationContext {
         INTERNAL_SUPERVISOR_ID,
         config.model?.runtimeKind === config.runtime ? config.model?.preferredModelId : undefined,
       );
+      this.agents.updatePreferredReasoning(
+        INTERNAL_SUPERVISOR_ID,
+        config.model?.runtimeKind === config.runtime ? config.model?.preferredReasoningValue : undefined,
+      );
       this._supervisorConfig = config;
     }
     this.options.onConversationPatch?.({ supervisorConfig: config });
@@ -345,23 +349,11 @@ export class ConversationContext {
     sourceAttachments?: MessageAttachment[],
     interactionMode?: InteractionMode,
   ): string {
-    return this.buildRuntimePromptContext(agentId, prompt, sourceMessageId, sourceAttachments, interactionMode).prompt;
-  }
-
-  private buildRuntimePromptContext(
-    agentId: AgentId,
-    prompt: string,
-    sourceMessageId?: string,
-    sourceAttachments?: MessageAttachment[],
-    interactionMode?: InteractionMode,
-    includeCompletedHistory = false,
-  ): RecoveryPrompt {
     const history = buildHistoryForAgent(agentId, this.messages.list(), {
       excludeMessageId: sourceMessageId,
-      includeCompletedHistory,
       ...(agentId === INTERNAL_SUPERVISOR_ID ? { maxTurns: SUPERVISOR_HISTORY_TURNS } : {}),
     });
-    const runtimePrompt = buildAgentContext({
+    return buildAgentContext({
       agentId,
       profiles: agentId === INTERNAL_SUPERVISOR_ID ? this.channelProfiles() : this._profiles,
       agentMessage: prompt,
@@ -371,13 +363,37 @@ export class ConversationContext {
       workspaceConfig: this._workspaceConfig,
       attachments: sourceAttachments,
     });
-    return { prompt: runtimePrompt, historyIncluded: history.length > 0 };
   }
 
   private handleLastDirectAgentChange(agentId: AgentId): void {
     if (this._lastDirectAgentId === agentId) return;
     this._lastDirectAgentId = agentId;
     this.options.onConversationPatch?.({ lastDirectAgentId: agentId });
+  }
+
+  /**
+   * 手动设置/清除普通对话的默认接收员工（Dot 0076）：绑定稳定 agentId，
+   * 必须是本会话工作区内真实存在且非内部的员工；null 表示清除默认，
+   * 此后无 @ 的消息会要求用户先指定，不静默改派。
+   */
+  setDefaultDirectAgent(agentId: AgentId | null): void {
+    if (agentId !== null && !this._profiles.some((profile) => profile.id === agentId && !profile.internal)) {
+      throw new Error(`Unknown agent for this conversation: ${agentId}`);
+    }
+    const next = agentId ?? undefined;
+    if (this._lastDirectAgentId === next) return;
+    const previous = this._lastDirectAgentId;
+    this._lastDirectAgentId = next;
+    const persisted = this.options.onConversationPatch?.({ lastDirectAgentId: agentId });
+    if (persisted === false) {
+      // 持久化失败（Dot 0096 核查命中的路径）：本方法是先改内存再经
+      // 回调落盘，回调曾把落盘失败静默吞掉——不回滚的话内存是新值、
+      // 磁盘是旧值，错误响应与实际状态脱节，重启后还会悄悄回到旧值。
+      // 回滚内存到原值（磁盘未变，无需再写），让显式设置路径的失败
+      // 重新成为「未提交」的可信信号，并把失败抛给调用方。
+      this._lastDirectAgentId = previous;
+      throw new Error("Failed to persist the default direct agent.");
+    }
   }
 
   private cwd(): string {

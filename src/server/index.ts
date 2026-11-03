@@ -10,6 +10,7 @@ import { disposeAcpConnectionPool, probeAcpModelState } from "../core/acp-runtim
 import { defaultAcpRunnerRegistry } from "../core/acp-runner-registry.ts";
 import { AGENT_TEAM_TEMPLATES, AgentConfigStore, validateAgentConfigs } from "../core/agent-config-store.ts";
 import { AgentModelStateStore, supervisorStorageKey } from "../core/agent-model-state-store.ts";
+import { findStaleSnapshotPreferenceOverwrite } from "../core/agent-model-guard.ts";
 import { probeAllRuntimes, runtimeKindToCliKey, type RuntimeProbeResult } from "../core/runtime-probe.ts";
 import type { AgentConfig } from "../core/agent-config-store.ts";
 import { WorkspaceConfigStore } from "../core/workspace-config-store.ts";
@@ -33,6 +34,7 @@ import { buildAttachmentHeaders } from "./attachment-response.ts";
 import { canSendMessage } from "../shared/message-validation.ts";
 import { resolveSlashSendTarget } from "../core/native-commands.ts";
 import { ConversationContext } from "./conversation-context.ts";
+import { DefaultAgentOperationRegistry } from "./default-agent-operations.ts";
 import { probeAgentCommands } from "./command-probe.ts";
 import { findPortOwners, isOrbitPortOwner, stopPortOwner } from "./port-recovery.ts";
 import { readJson, RequestBodyTooLargeError } from "./read-json.ts";
@@ -77,6 +79,8 @@ const execFileAsync = promisify(execFile);
 // --- Shared singletons ---
 const eventBus = new EventBus();
 const sseHub = new SseHub();
+/** 默认接收人变更的操作登记（Dot 0096 终结屏障）：按会话串行并记录终结状态。 */
+const defaultAgentOperations = new DefaultAgentOperationRegistry();
 const workspaceStore = new WorkspaceStore();
 const configStore = new AgentConfigStore();
 const agentModelStateStore = new AgentModelStateStore();
@@ -182,11 +186,26 @@ async function probeConfiguredAgentModels(
         const storageKey = isSupervisor ? supervisorStorageKey(targetConversationId!) : target.id;
         const previous = existing[storageKey];
         const hasSessionValue = previous?.runtimeKind === runtimeKind && previous.currentValueSource === "session";
+        // 探针只是预览（Dot 0055 合同）：已有会话确认状态时，探针写回不得
+        // 覆盖会话已确认的思考强度当前值，也不得把变体快照降级回基础
+        // 模型形态——两处都与 currentValue 一样以会话值为准（复核 P1/P2）。
+        const reasoning = hasSessionValue && previous.reasoning && snapshot.reasoning?.configId === previous.reasoning.configId
+          ? { ...snapshot.reasoning, currentValue: previous.reasoning.currentValue, currentValueSource: "session" as const }
+          : hasSessionValue && previous.reasoning && !snapshot.reasoning
+            ? previous.reasoning
+            : snapshot.reasoning;
+        const keepVariant = hasSessionValue &&
+          previous.modelApplyPath === "session_model" &&
+          snapshot.modelApplyPath !== "session_model";
         const targetSnapshot = {
           ...snapshot,
           agentId: target.id,
           currentValue: hasSessionValue ? previous.currentValue : undefined,
           currentValueSource: hasSessionValue ? "session" as const : "probe" as const,
+          ...(reasoning ? { reasoning } : {}),
+          ...(keepVariant
+            ? { choices: previous.choices, configId: previous.configId, modelApplyPath: "session_model" as const }
+            : {}),
         };
         agentModelStateStore.update(workspaceId, targetSnapshot, storageKey);
         sseHub.publish({
@@ -516,8 +535,13 @@ function createContext(workspaceId: string, conversationId: string): Conversatio
         if (workspaceId === activeWorkspaceId && conversationId === activeConversationId) {
           activeConversation = toActiveConversation(updated);
         }
+        return true;
       } catch {
-        // 持久化失败不阻断路由流程；模式仍在本会话上下文中生效
+        // 持久化失败不阻断路由流程；模式仍在本会话上下文中生效。
+        // 返回 false 供显式设置默认接收人的路径回滚内存并报错（Dot
+        // 0096：此前静默吞掉落盘失败，会让内存已改、磁盘未改而响应
+        // 仍报成功）；其余调用方忽略返回值，行为不变。
+        return false;
       }
     },
   });
@@ -709,14 +733,14 @@ runAttachmentDraftCleanup();
 function parseSupervisorConfig(input: { runtime?: unknown; model?: unknown }):
   { config: SupervisorConfig } | { error: string } {
   if (!isAgentRuntimeKind(input.runtime)) {
-    return { error: "监工运行时必须是 claude-code、codex 或 codebuddy。" };
+    return { error: "监工运行时必须是 claude-code、codex、codebuddy、dsh 或 workbuddy。" };
   }
   const runtime = input.runtime;
   if (input.model === undefined || input.model === null) return { config: { runtime } };
   if (typeof input.model !== "object" || Array.isArray(input.model)) {
     return { error: "监工模型配置格式不正确。" };
   }
-  const model = input.model as { preferredModelId?: unknown; runtimeKind?: unknown };
+  const model = input.model as { preferredModelId?: unknown; preferredReasoningValue?: unknown; runtimeKind?: unknown };
   if (model.runtimeKind !== undefined && !isAgentRuntimeKind(model.runtimeKind)) {
     return { error: "监工模型配置格式不正确。" };
   }
@@ -725,17 +749,32 @@ function parseSupervisorConfig(input: { runtime?: unknown; model?: unknown }):
     && typeof model.preferredModelId !== "string") {
     return { error: "监工模型配置格式不正确。" };
   }
+  if (model.preferredReasoningValue !== undefined
+    && model.preferredReasoningValue !== null
+    && typeof model.preferredReasoningValue !== "string") {
+    return { error: "监工模型配置格式不正确。" };
+  }
   const preferredModelId = typeof model.preferredModelId === "string"
     ? model.preferredModelId.trim()
     : "";
   if (preferredModelId.length > 512) {
     return { error: "监工模型标识过长。" };
   }
-  if (!preferredModelId) return { config: { runtime } };
+  const preferredReasoningValue = typeof model.preferredReasoningValue === "string"
+    ? model.preferredReasoningValue.trim()
+    : "";
+  if (preferredReasoningValue.length > 512) {
+    return { error: "监工思考强度标识过长。" };
+  }
+  if (!preferredModelId && !preferredReasoningValue) return { config: { runtime } };
   return {
     config: {
       runtime,
-      model: { preferredModelId, runtimeKind: isAgentRuntimeKind(model.runtimeKind) ? model.runtimeKind : runtime },
+      model: {
+        ...(preferredModelId ? { preferredModelId } : {}),
+        ...(preferredReasoningValue ? { preferredReasoningValue } : {}),
+        runtimeKind: isAgentRuntimeKind(model.runtimeKind) ? model.runtimeKind : runtime,
+      },
     },
   };
 }
@@ -1608,6 +1647,91 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+
+    // 默认接收员工（Dot 0076）：普通对话模式下无 @ 消息的固定收件人。
+    // 只改会话记录，不发送任何消息；agentId 必须是本工作区员工，null 为清除。
+    // 终结屏障（Dot 0096）：客户端每次变更带唯一 operationId，服务端按
+    // 会话串行执行（DefaultAgentOperationRegistry.runExclusive），并把该
+    // 操作登记为 pending → committed / failed。committed 的判据是落盘后
+    // 读回的持久值与目标一致；持久化失败时上下文回滚内存状态并抛错
+    // （见 ConversationContext.setDefaultDirectAgent），因此错误响应
+    // 重新成为「未提交」的可信信号。客户端在 PUT 结果不确定时凭操作号
+    // 查操作状态裁决终结，不再以单次重读的值解锁。
+    if (req.method === "PUT" && url.pathname.startsWith("/api/conversations/") && url.pathname.endsWith("/default-agent")) {
+      const parts = url.pathname.split("/");
+      const convId = parts[3];
+      if (!convId) { sendJson(res, 400, { ok: false, message: "Missing conversation id." }); return; }
+      const target = resolveTarget(url);
+      if (!target || target.conversationId !== convId) {
+        sendJson(res, 409, { ok: false, message: "workspaceId and conversationId are required." });
+        return;
+      }
+      const input = (await readJson(req)) as { agentId?: unknown; operationId?: unknown };
+      if (input.agentId !== null && typeof input.agentId !== "string") {
+        sendJson(res, 400, { ok: false, message: "agentId (string or null) is required." });
+        return;
+      }
+      const ctx = contextForTarget(target);
+      if (!ctx) { sendJson(res, 409, { ok: false, message: "No active conversation context." }); return; }
+      const agentId = input.agentId as AgentId | null;
+      const operationId = typeof input.operationId === "string" && input.operationId.length > 0
+        ? input.operationId
+        : null;
+      const operationKey = `${target.workspaceId}\n${convId}`;
+      await defaultAgentOperations.runExclusive(operationKey, async () => {
+        if (operationId) defaultAgentOperations.begin(operationKey, operationId, agentId);
+        try {
+          const current = conversationStoreFor(target.workspaceId).get(target.workspaceId, convId);
+          if (!current) throw new Error("Conversation not found.");
+          ctx.setDefaultDirectAgent(agentId);
+          const updated = conversationStoreFor(target.workspaceId).get(target.workspaceId, convId) ?? current;
+          if ((updated.lastDirectAgentId ?? null) !== agentId) {
+            // 读回的持久值与目标不一致：不得把这次变更报成已提交。
+            // 内存以读回的持久值为准对齐（其落盘值即当前磁盘值），
+            // 操作记为失败，客户端按未提交处理。
+            try {
+              ctx.setDefaultDirectAgent(updated.lastDirectAgentId ?? null);
+            } catch {
+              // 读回值对应的员工已不存在时保持内存现状，仍按失败上报。
+            }
+            throw new Error("Failed to persist the default direct agent.");
+          }
+          const operation = operationId
+            ? defaultAgentOperations.commit(operationKey, operationId, agentId)
+            : undefined;
+          sendJson(res, 200, { ok: true, conversation: updated, ...(operation ? { operation } : {}) });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const operation = operationId
+            ? defaultAgentOperations.fail(operationKey, operationId, message)
+            : undefined;
+          sendJson(res, 409, { ok: false, message, ...(operation ? { operation } : {}) });
+        }
+      });
+      return;
+    }
+
+    // 默认接收人变更的操作状态查询（Dot 0096 终结屏障）：客户端在 PUT
+    // 结果不确定时凭 operationId 查询该次变更是否已终结。查不到记录
+    //（服务端重启后操作表为空）返回 operation: null——重启后不存在
+    // 仍在途的 PUT，客户端可改以状态重读值作为终局权威值。
+    if (req.method === "GET" && url.pathname.startsWith("/api/conversations/") && url.pathname.endsWith("/default-agent-operation")) {
+      const parts = url.pathname.split("/");
+      const convId = parts[3];
+      if (!convId) { sendJson(res, 400, { ok: false, message: "Missing conversation id." }); return; }
+      const target = resolveTarget(url);
+      if (!target || target.conversationId !== convId) {
+        sendJson(res, 409, { ok: false, message: "workspaceId and conversationId are required." });
+        return;
+      }
+      const operationId = url.searchParams.get("operationId");
+      const operation = operationId
+        ? defaultAgentOperations.get(`${target.workspaceId}\n${convId}`, operationId)
+        : undefined;
+      sendJson(res, 200, { ok: true, operation: operation ?? null });
+      return;
+    }
+
     if (req.method === "PUT" && url.pathname.startsWith("/api/conversations/")) {
       const parts = url.pathname.split("/");
       const convId = parts[3];
@@ -2134,6 +2258,23 @@ async function handlePutAgents(req: http.IncomingMessage, res: http.ServerRespon
 
   // modelState 是 GET 响应合并的运行时快照，保存前剥离，避免污染 agents.json。
   const configs = input.map(({ modelState: _modelState, modelProbe: _modelProbe, ...config }) => config);
+  // 设置页保存防护：载荷偏好若恰好等于过期会话快照的当前值、且与库内已保存
+  // 偏好不同，拒绝保存，避免把较新的模型偏好静默盖回旧值。注意：刷新模型
+  // 列表不会自动解开拦截——mergeProbedConfigs 保留本地未保存的选择；解开
+  // 靠关闭面板不保存、重开后改回已保存偏好，或改选新值（Dot 0094 口径，
+  // 详见 agent-model-guard.ts）。
+  const staleOverwrite = findStaleSnapshotPreferenceOverwrite(
+    configStore.load(workspaceId),
+    configs,
+    agentModelStateStore.load(workspaceId),
+  );
+  if (staleOverwrite) {
+    sendJson(res, 409, {
+      ok: false,
+      message: `员工「${staleOverwrite.agentName}」的${staleOverwrite.field === "model" ? "模型" : "思考强度"}偏好已拒绝保存：提交的值与一份较早的会话记录相同，可能来自过期的模型列表，保存会覆盖较新的偏好。解开方法：关闭设置面板且不要保存，重新打开后把该员工的${staleOverwrite.field === "model" ? "模型" : "思考强度"}改回标注「已保存的首选」的那一项（重新打开时已保存偏好即为选中项）再保存，或改选一个不等于该旧记录值的新偏好。注意：点「刷新模型列表」只会更新可选列表，不会自动把已修改的选择改回已保存偏好。本拦截只针对这一种过期值覆盖（特定签名），并非通用的并发保存保护。`,
+    });
+    return;
+  }
   configStore.save(workspaceId, configs);
   refreshEnabledAgentsForWorkspace(workspaceId, configs);
   if (workspaceId === activeWorkspaceId) allConfigs = configs;
