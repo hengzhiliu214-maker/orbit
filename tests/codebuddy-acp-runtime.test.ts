@@ -604,14 +604,33 @@ test("rejects incompatible ACP protocol versions", async () => {
   await assert.rejects(runtime.run(runOptions()).result, /requires 1/);
 });
 
-test("reports unsupported session restoration as a resume failure", async () => {
-  const fake = fakeConnector({ capabilities: {} });
+test("unsupported restoration replaces the session and submits recovered history once", async () => {
+  const output: string[] = [];
+  const fake = fakeConnector({ capabilities: {}, onPrompt(notify) {
+    notify({ sessionId: "new-session", update: {
+      sessionUpdate: "agent_message_chunk", content: { type: "text", text: "recovered" },
+    } });
+  } });
   const runtime = createCodeBuddyAcpRuntime(fake.connector);
-
-  await assert.rejects(
-    runtime.run(runOptions({ resumeSessionId: "stale-session" })).result,
-    /could not resume/,
-  );
+  let builds = 0;
+  const handle = runtime.run(runOptions({
+    resumeSessionId: "stale-session", prompt: "CURRENT-901",
+    recoveryPrompt: () => {
+      builds += 1;
+      return { prompt: "HISTORY-812\nCURRENT-901", historyIncluded: true };
+    },
+    onOutput: (text: string) => output.push(text),
+  }));
+  assert.equal(await handle.result, "recovered");
+  assert.equal(await handle.sessionId, "new-session");
+  assert.equal(builds, 1);
+  const prompts = fake.calls.filter(c => c.method === "session/prompt");
+  assert.equal(prompts.length, 1);
+  const payload = JSON.stringify(prompts[0]!.value);
+  assert.ok(payload.includes("HISTORY-812"));
+  assert.equal(payload.split("CURRENT-901").length - 1, 1);
+  assert.equal(fake.calls.filter(c => c.method === "session/new").length, 1);
+  assert.ok(output.some(text => text.includes("补回本会话可用")));
 });
 
 test("maps ACP tool lifecycle updates to Orbit activity events", async () => {

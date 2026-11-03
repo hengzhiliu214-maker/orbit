@@ -1236,3 +1236,25 @@ test("a probed snapshot is invalidated when the real session lands and is repopu
 
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test("ACP failures after prompt delivery never trigger outer whole-turn replay", async () => {
+  const dir = tmpDir();
+  const store = new SessionStore(dir);
+  const calls: AgentRuntimeRunOptions[] = [];
+  const runtime: AgentRuntime = {
+    kind: "codebuddy", transport: "acp",
+    run(options) {
+      calls.push(options);
+      return { process: {kill() {}, interrupt() {}, pid: 1}, sessionId: Promise.resolve("old"), result: Promise.reject(new Error("session not found after tool execution")) };
+    },
+  };
+  store.save("codebuddy", "default", "developer", {agentId:"developer",runtime:"codebuddy",sessionId:"old",lastRunAt:new Date().toISOString(),runCount:1});
+  const session = new AgentSession({id:"developer",label:"Developer",cwd:dir,runtime,eventBus:new EventBus(),sessionStore:store,conversationId:"default"});
+  const recovery = () => ({prompt:"recovered",historyIncluded:true});
+  try {
+    session.start();
+    await assert.rejects(session.send("run-1", "current", undefined, "ask", recovery), /session not found/);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].recoveryPrompt, recovery);
+  } finally { session.stop(); fs.rmSync(dir, {recursive:true,force:true}); }
+});

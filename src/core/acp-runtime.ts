@@ -374,14 +374,26 @@ export function runAcp(
         throw cancellationError();
       }
 
+      let prompt = options.prompt;
+      if (session.replacedSession) {
+        const recovery = options.recoveryPrompt?.();
+        if (recovery) prompt = recovery.prompt;
+        options.onOutput?.(recovery?.historyIncluded
+          ? "已新建会话，并补回本会话可用的历史上下文；较早内容可能已被截断。"
+          : "已新建会话，之前的上下文未能恢复。请补充必要信息后继续。");
+      }
+      const promptContent = buildPromptContent(prompt, options.attachments, initialized.agentCapabilities);
       acceptingUpdates = !forcedCancelled;
       let response: Awaited<ReturnType<AcpConnection["prompt"]>>;
       try {
         response = await connection.prompt({
           sessionId: activeSessionId,
-          prompt: buildPromptContent(options.prompt, options.attachments, initialized.agentCapabilities),
+          prompt: promptContent,
         });
       } catch (error) {
+        if (!cancelled && !forcedCancelled) {
+          options.onOutput?.("请求已尝试发送，执行结果待核实；未自动重发。请先核对任务结果，再决定是否重新发送。");
+        }
         throw normalizePromptError(error, definition.displayName, options.attachments);
       }
       acceptingUpdates = false;
@@ -572,6 +584,7 @@ export async function probeAcpCommands(
 
 /** 会话建立结果：sessionId 加上本次建立路径拿到的 config options 快照。 */
 export type AcpSessionSetup = {
+  replacedSession?: boolean;
   sessionId: string;
   configOptions: Array<SessionConfigOption> | null | undefined;
   reusedConnectionSession: boolean;
@@ -609,9 +622,9 @@ async function prepareSession(
     return { sessionId: existingSessionId, configOptions: loaded.configOptions, reusedConnectionSession: false };
   }
 
-  throw new Error(
-    `${displayName} ACP could not resume the session because the agent does not advertise session/load or session/resume.`,
-  );
+  const created = await connection.newSession({ cwd: absoluteCwd, mcpServers: [] });
+  return { sessionId: created.sessionId, configOptions: created.configOptions,
+    reusedConnectionSession: false, replacedSession: true };
 }
 
 export type AcpSessionRestoreClassification = "recoverable" | "unrecoverable";
@@ -677,7 +690,12 @@ async function restoreOrRecoverSession(
         options.resumeSessionId,
         definition.displayName,
       );
-      options.onOutput?.(`${definition.displayName} 会话恢复时连接中断，已在新连接上恢复原会话。`);
+      // 第二次 initialize 若已丧失 resume/load 能力，prepareSession 会退化为
+      // newSession（replacedSession：新会话），runAcp 已输出「已新建会话」；
+      // 这里不能再说「已恢复原会话」，否则同一回合出现两条矛盾提示。
+      if (!setup.replacedSession) {
+        options.onOutput?.(`${definition.displayName} 会话恢复时连接中断，已在新连接上恢复原会话。`);
+      }
       return setup;
     }
 
@@ -685,7 +703,7 @@ async function restoreOrRecoverSession(
     options.onOutput?.(
       `原 ${definition.displayName} 会话无法恢复（${summarizeRestoreFailure(error)}），已使用新的会话继续。`,
     );
-    return { sessionId: created.sessionId, configOptions: created.configOptions, reusedConnectionSession: false };
+    return { sessionId: created.sessionId, configOptions: created.configOptions, reusedConnectionSession: false, replacedSession: true };
   }
 }
 

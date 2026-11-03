@@ -50,6 +50,11 @@ type FakeConnectionControls = {
   setConfigOptionConfigOptions?: Array<SessionConfigOption>;
   /** PR #147：initialize 返回的 Agent 能力（如 promptCapabilities.image）。 */
   capabilities?: AgentCapabilities;
+  /**
+   * 第二次连接的能力降级：复现 reconnect 后 initialize 不再提供
+   * resume / loadSession 的退化路径（prepareSession 会返回 replacedSession）。
+   */
+  secondCapabilities?: AgentCapabilities;
   /** issue #160：让 newSession 挂起，模拟 session/new 响应前的创建窗口。 */
   hangNewSession?: boolean;
 };
@@ -74,6 +79,9 @@ function fakeConnector(controls: FakeConnectionControls = {}) {
       pid: 4242,
       initialize() {
         calls.push("initialize");
+        if (connectionSpawn > 1 && controls.secondCapabilities) {
+          return Promise.resolve({ protocolVersion: 1, agentCapabilities: controls.secondCapabilities });
+        }
         return controls.hangInitialize
           ? new Promise<InitializeResponse>(() => {})
           : Promise.resolve({
@@ -603,6 +611,47 @@ test("a retry that fails again settles as a normal error", async () => {
   });
   assert.equal(fake.spawnCount, 2, "只允许重试一次");
   assert.ok(!fake.calls.some((call) => call.startsWith("session/new:")), "重试失败不得静默降级新建");
+});
+
+test("a reconnected session that degrades to a new session must not also claim a restore", async () => {
+  // 第二次 initialize 若已丧失 resume / loadSession 能力，prepareSession 会退化
+  // 为 newSession（replacedSession）。此时 runAcp 已输出「已新建会话」，可恢复
+  // 分支不得再补一条「已在新连接上恢复原会话」——同一回合不能出现矛盾提示。
+  const output: string[] = [];
+  let builds = 0;
+  const fake = fakeConnector({
+    resumeCapability: true,
+    answerText: "答复文本",
+    resumeError: new Error("Fake Agent ACP transport closed (stdout ended while pid 1 was still running)."),
+    secondCapabilities: {} as AgentCapabilities,
+  });
+  const handle = runAcp(
+    runOptions({
+      resumeSessionId: "old-session",
+      prompt: "CURRENT-PROBE-7481",
+      recoveryPrompt: () => {
+        builds += 1;
+        return { prompt: "HISTORY-ANCHOR-6912\nCURRENT-PROBE-7481", historyIncluded: true };
+      },
+      onOutput: (text: string) => output.push(text),
+    }),
+    definition,
+    fake.connector,
+  );
+
+  await handle.result;
+  assert.equal(fake.spawnCount, 2, "可恢复失败仍走新连接重试");
+  assert.ok(fake.calls.includes("session/new:2"), "能力降级后必须新建会话");
+  assert.equal(fake.prompts.length, 1, "prompt 只投递一次");
+  assert.equal(builds, 1, "替换会话时 recoveryPrompt 只构建一次");
+  const payload = JSON.stringify(fake.prompts[0]);
+  assert.equal(payload.split("HISTORY-ANCHOR-6912").length - 1, 1, "历史锚点在 prompt 中恰好出现一次");
+  assert.equal(payload.split("CURRENT-PROBE-7481").length - 1, 1, "当前输入在 prompt 中恰好出现一次");
+  assert.ok(output.some((text) => text.includes("已新建会话")), `expected replacement notice in: ${output.join(" | ")}`);
+  assert.ok(
+    !output.some((text) => text.includes("已在新连接上恢复原会话")),
+    `must not claim a restore after replacement: ${output.join(" | ")}`,
+  );
 });
 
 test("an unclassified resume failure settles as a normal error without fallback", async () => {
@@ -1137,3 +1186,83 @@ test("runAcp forwards the attachment list into the session prompt", async () => 
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
+
+// 附件投递计数（c）：正常恢复与替换会话两条路径共用 runAcp:391 的同一处
+// 拼装，必须保证每个附件恰好产生一个 image / resource_link 块，且 prompt
+// 只投递一次。文本块里的附件说明另计，不在此断言。
+for (const scenario of ["restored", "replaced"] as const) {
+  test(`session continuity attachments: ${scenario} delivers each attachment exactly once`, async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "orbit-acp-continuity-attach-"));
+    try {
+      const imagePath = path.join(tempDir, "chart.png");
+      fs.writeFileSync(imagePath, PNG_BYTES);
+      const attachments = [
+        makeAttachment({ id: "img-1", kind: "image", mimeType: "image/png", filename: "chart.png", path: imagePath, size: PNG_BYTES.length }),
+        makeAttachment({ id: "pdf-1", kind: "file", mimeType: "application/pdf", filename: "spec.pdf", path: path.join(tempDir, "spec.pdf"), size: 4096 }),
+      ];
+      const fake = fakeConnector({
+        resumeCapability: true,
+        answerText: "done",
+        resumeError: scenario === "replaced" ? new Error("session not found") : undefined,
+        capabilities: { promptCapabilities: { image: true } } as AgentCapabilities,
+      });
+      const handle = runAcp(runOptions({
+        resumeSessionId: "old-session",
+        prompt: "CURRENT-PROBE-7481",
+        attachments,
+        recoveryPrompt: () => ({ prompt: "HISTORY-ANCHOR-6912\nCURRENT-PROBE-7481", historyIncluded: true }),
+      }), definition, fake.connector);
+      await handle.result;
+
+      assert.equal(fake.prompts.length, 1, "prompt must be issued exactly once on both continuity paths");
+      const blocks = fake.prompts[0] as Array<{ type: string }>;
+      assert.equal(blocks.filter((block) => block.type === "text").length, 1, "exactly one text block on both paths");
+      const attachmentBlocks = blocks.filter((block) => block.type === "image" || block.type === "resource_link");
+      assert.equal(attachmentBlocks.length, attachments.length, "one content block per attachment, no duplicates");
+      assert.equal(attachmentBlocks.filter((block) => block.type === "image").length, 1, "the image maps to exactly one image block");
+      assert.equal(attachmentBlocks.filter((block) => block.type === "resource_link").length, 1, "the file maps to exactly one resource_link block");
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const scenario of ["restored", "reconnected", "replaced", "empty", "unknown", "exhausted", "prompt-failure"] as const) {
+  test(`session continuity: ${scenario} inspects actual prompt delivery`, async () => {
+    const recovering = scenario === "replaced" || scenario === "empty";
+    const transient = scenario === "reconnected" || scenario === "exhausted";
+    const fake = fakeConnector({
+      resumeCapability: true,
+      answerText: "done",
+      resumeError: recovering ? new Error("session not found")
+        : transient ? new Error("connection closed")
+        : scenario === "unknown" ? new Error("mystery failure") : undefined,
+      secondResumeError: scenario === "exhausted" ? new Error("connection closed") : undefined,
+      promptError: scenario === "prompt-failure" ? new Error("session not found after delivery") : undefined,
+    });
+    let builds = 0;
+    const output: string[] = [];
+    const handle = runAcp(runOptions({
+      resumeSessionId: "old-session",
+      prompt: "CURRENT-PROBE-7481",
+      recoveryPrompt: () => {
+        builds += 1;
+        return { prompt: scenario === "empty" ? "CURRENT-PROBE-7481" : "HISTORY-ANCHOR-6912\nCURRENT-PROBE-7481", historyIncluded: scenario !== "empty" };
+      },
+      onOutput: (text: string) => output.push(text),
+    }), definition, fake.connector);
+    if (["unknown", "exhausted", "prompt-failure"].includes(scenario)) await assert.rejects(handle.result);
+    else await handle.result;
+    const preDeliveryFailure = scenario === "unknown" || scenario === "exhausted";
+    assert.equal(fake.prompts.length, preDeliveryFailure ? 0 : 1);
+    assert.equal(builds, recovering ? 1 : 0);
+    if (!preDeliveryFailure) {
+      const payload = JSON.stringify(fake.prompts[0]);
+      assert.equal(payload.split("CURRENT-PROBE-7481").length - 1, 1);
+      assert.equal(payload.includes("HISTORY-ANCHOR-6912"), scenario === "replaced");
+    }
+    if (scenario === "prompt-failure") assert.ok(output.some(text => text.includes("执行结果待核实")));
+    if (recovering) assert.ok(output.some(text => text.includes(scenario === "empty" ? "上下文未能恢复" : "补回本会话可用")));
+    if (preDeliveryFailure || scenario === "prompt-failure") assert.equal(fake.calls.filter(c => c.startsWith("session/new:")).length, 0);
+  });
+}

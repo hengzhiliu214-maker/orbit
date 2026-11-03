@@ -28,9 +28,13 @@ export function isAgentRunCancelledError(error: unknown): error is AgentRunCance
   return error instanceof AgentRunCancelledError;
 }
 
+export type RecoveryPrompt = { prompt: string; historyIncluded: boolean };
+
 export type AgentRuntimeRunOptions = {
   agentId: AgentId;
   prompt: string;
+  /** Rebuild bounded conversation context only when a saved session is replaced. */
+  recoveryPrompt?: () => RecoveryPrompt;
   cwd: string;
   approvalMode?: ApprovalMode;
   requestPermission?: (request: AgentPermissionRequest) => Promise<PermissionDecision>;
