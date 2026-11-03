@@ -2056,6 +2056,31 @@ button:active:not(:disabled) {
   padding: 0 8px 7px;
 }
 
+.defaultReceiverControl {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 8px;
+  font-size: 12px;
+  white-space: nowrap;
+  opacity: 0.85;
+}
+
+.defaultReceiverControl select {
+  min-height: 30px;
+  max-width: 180px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+
+.defaultReceiverPending {
+  font-size: 12px;
+  opacity: 0.75;
+}
+
 .approvalModeControl,
 .interactionModeControl {
   position: relative;
