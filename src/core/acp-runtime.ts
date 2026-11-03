@@ -669,13 +669,16 @@ async function prepareSession(
   );
 }
 
-export type AcpSessionRestoreClassification = "recoverable" | "unrecoverable";
+export type AcpSessionRestoreClassification = "recoverable" | "unrecoverable" | "ambiguous";
 
 /**
- * 会话恢复失败的保守分类（issue #141）。只把 runtime 明确报告的会话状态
- * 冲突或损坏归为不可恢复；传输断开、网络超时、进程退出归为可恢复（会话
- * 本身仍有效，换一条连接即可）。识别不了的一律返回 null，按普通错误落定，
- * 不自动降级。
+ * 会话恢复失败的保守分类（issue #141；Dot 0092 第 2 项收窄）。只把 runtime
+ * 明确报告的会话状态冲突或损坏归为不可恢复；传输断开、网络超时、进程退出
+ * 归为可恢复（会话本身仍有效，换一条连接即可）。泛化内部错误（JSON-RPC
+ * -32603 / "internal error"）不带会话状态细节，单次出现不足以证明原会话
+ * 已失效，归为「证据不足」：先在新连接上重试同一绑定，只有同一绑定被同类
+ * 错误再次拒绝才构成失效实据（见 restoreOrRecoverSession）。识别不了的
+ * 一律返回 null，按普通错误落定，不自动降级。
  */
 export function classifySessionRestoreError(error: unknown): AcpSessionRestoreClassification | null {
   const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
@@ -683,11 +686,11 @@ export function classifySessionRestoreError(error: unknown): AcpSessionRestoreCl
     return "unrecoverable";
   }
   // Agent 以 JSON-RPC 内部错误拒绝恢复（实测 dsh 跨进程 resume 返回 -32603
-  // "Internal error"）：错误文本不带会话状态细节，但原会话在该进程内已不可
-  // 恢复；按不可恢复降级新建会话，好过整轮以裸错误在建立阶段失败。
+  // "Internal error"）：这类错误也可能只是 runtime 的一时内部故障，通用
+  // 内部错误不等于会话失效，不得据此单次确定性降级。
   const errorCode = (error as { code?: unknown } | null | undefined)?.code;
   if (errorCode === -32603 || message.includes("internal error")) {
-    return "unrecoverable";
+    return "ambiguous";
   }
   if (/transport|connection closed|timeout|timed out|process exited|process failed|econnreset|econnrefused|epipe|socket hang up|aborted/.test(message)) {
     return "recoverable";
@@ -701,13 +704,17 @@ function summarizeRestoreFailure(error: unknown): string {
 }
 
 /**
- * 恢复既有会话，失败时按分类降级（issue #141）：
- * - 可恢复（传输断开/超时/进程退出）：销毁当前 lease，用新连接和同一个
- *   sessionId 重试一次，再失败按普通错误落定；
- * - 不可恢复（会话状态冲突或损坏）：直接 newSession，让调用方的 sessionId
- *   落定新值（AgentSession 随后持久化新绑定；Orbit 侧会话、消息历史与员工
- *   配置一律不变）。
- * 两种路径都通过 onOutput 输出过程提示，不改写正文。
+ * 恢复既有会话，失败时按分类处理（issue #141；Dot 0092 第 2 项收窄）：
+ * - 不可恢复（会话状态冲突或损坏，有明确实据）：直接新建会话降级；
+ * - 可恢复（传输断开/超时/进程退出）与证据不足（泛化内部错误）：都先销毁
+ *   当前 lease，用新连接和同一个 sessionId 重试一次。可恢复路径重试再
+ *   失败按普通错误落定；证据不足路径只有同一绑定在新连接上被同类错误
+ *   （证据不足或不可恢复）再次拒绝，才构成「原会话确已失效」的实据，
+ *   按不可恢复降级；重试以其他方式失败一律按普通错误落定，保留原绑定，
+ *   由主人下一条消息决定，不擅自换会话。
+ * 降级新建的会话与全新会话共用同一份 options.prompt（由调用方统一经
+ * buildAgentContext 组装，含会话历史注入），失去的只是 runtime 内部的
+ * 会话状态；降级提示走过程叙述流持久留痕（见 downgradeToFreshSession）。
  */
 async function restoreOrRecoverSession(
   connection: AcpConnection,
@@ -733,10 +740,14 @@ async function restoreOrRecoverSession(
     const classification = classifySessionRestoreError(error);
     if (!classification) throw error;
 
-    if (classification === "recoverable") {
-      const replacement = reconnect();
-      const reinitialized = await replacement.initialize(initializeRequest);
-      validateInitializeResponse(reinitialized, definition.displayName);
+    if (classification === "unrecoverable") {
+      return downgradeToFreshSession(connection, options, definition, absoluteCwd, error);
+    }
+
+    const replacement = reconnect();
+    const reinitialized = await replacement.initialize(initializeRequest);
+    validateInitializeResponse(reinitialized, definition.displayName);
+    try {
       const setup = await prepareSession(
         replacement,
         reinitialized.agentCapabilities,
@@ -744,21 +755,48 @@ async function restoreOrRecoverSession(
         options.resumeSessionId,
         definition.displayName,
       );
-      options.onOutput?.(`${definition.displayName} 会话恢复时连接中断，已在新连接上恢复原会话。`);
+      options.onOutput?.(classification === "recoverable"
+        ? `${definition.displayName} 会话恢复时连接中断，已在新连接上恢复原会话。`
+        : `${definition.displayName} 会话恢复被拒绝，已在新连接上恢复原会话。`);
       return setup;
+    } catch (retryError) {
+      if (classification === "ambiguous") {
+        const retryClassification = classifySessionRestoreError(retryError);
+        if (retryClassification === "ambiguous" || retryClassification === "unrecoverable") {
+          return downgradeToFreshSession(replacement, options, definition, absoluteCwd, retryError);
+        }
+      }
+      throw retryError;
     }
-
-    const created = await connection.newSession({ cwd: absoluteCwd, mcpServers: [] });
-    options.onOutput?.(
-      `原 ${definition.displayName} 会话无法恢复（${summarizeRestoreFailure(error)}），已使用新的会话继续。`,
-    );
-    return {
-      sessionId: created.sessionId,
-      configOptions: created.configOptions,
-      reusedConnectionSession: false,
-      models: legacyModelStateOf(created),
-    };
   }
+}
+
+/**
+ * 降级新建会话：让调用方的 sessionId 落定新值（AgentSession 随后持久化新
+ * 绑定；Orbit 侧会话、消息历史与员工配置一律不变）。提示必须在持久时间线
+ * 留痕，因此与模型切换提示一样走过程叙述流（process.text，见
+ * emitModelNotice），不走 onOutput 的终端文本——后者会被分类进最终回复
+ * 分组并在结算时剔除（2026-11-03 实测：降级提示只出现在实时流，未进入
+ * 持久时间线）。
+ */
+async function downgradeToFreshSession(
+  connection: AcpConnection,
+  options: AcpRunOptions,
+  definition: AcpRuntimeDefinition,
+  absoluteCwd: string,
+  error: unknown,
+): Promise<AcpSessionSetup> {
+  const created = await connection.newSession({ cwd: absoluteCwd, mcpServers: [] });
+  emitModelNotice(
+    options,
+    `原 ${definition.displayName} 会话无法恢复（${summarizeRestoreFailure(error)}），已重建新会话继续；新会话沿用同一份上下文组装，仅运行时内部状态重置。`,
+  );
+  return {
+    sessionId: created.sessionId,
+    configOptions: created.configOptions,
+    reusedConnectionSession: false,
+    models: legacyModelStateOf(created),
+  };
 }
 
 /**

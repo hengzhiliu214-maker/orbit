@@ -74,7 +74,11 @@ test("保存防护：改成与快照无关的新值不拦截", () => {
   assert.equal(findStaleSnapshotPreferenceOverwrite(stored, incoming, { verification: dshSnapshot() }), undefined);
 });
 
-test("保存防护：刷新列表后快照来源为 probe，同样的值不再拦截", () => {
+test("保存防护：快照来源为 probe 时同样的值不拦截（不等于刷新必然放行）", () => {
+  // 本用例只验证函数对 probe 来源快照本身的判定。对已有会话确认值的
+  // 员工，设置页刷新按合同保留会话来源（探针不得覆盖会话确认的
+  // currentValue 与来源），实测中刷新后同一保存仍会被拦——因此不能
+  // 把本用例读作「点刷新即可解开拦截」；准确口径见 agent-model-guard.ts。
   const stored = [dshConfig({ preferredModelId: WORKBUDDY_PAIR, runtimeKind: "dsh" })];
   const incoming = [dshConfig({ preferredModelId: OFFICIAL_PAIR, runtimeKind: "dsh" })];
   const probed = dshSnapshot({ currentValueSource: "probe" });

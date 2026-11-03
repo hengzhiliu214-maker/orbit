@@ -11,6 +11,7 @@ import { type AgentActivityEvent, type AgentCommand, type AgentCommandsSnapshot,
 import { attachmentAcceptAttribute } from "../shared/attachment-registry.ts";
 import { canSendMessage } from "../shared/message-validation.ts";
 import { createAttachmentUploadLifecycle } from "./attachment-upload-state.ts";
+import { createDefaultAgentChangeTracker } from "./default-agent-change-state.ts";
 import { createConversationForUpload } from "./attachment-upload-conversation.ts";
 import { appendTransientProcessActivity, collapseToolExecutions, type ProcessToolActivity, type ProcessToolExecution } from "../shared/process-activity.ts";
 import { WorkAnalysisPanel } from "./WorkAnalysisPanel.tsx";
@@ -200,6 +201,9 @@ export function App() {
   /** 附件上传生命周期：上下文版本绑定的上传计数与附件槽位（PR #147 M1 竞态修复）。 */
   const attachmentUploadLifecycleRef = useRef(createAttachmentUploadLifecycle());
   const [uploadingAttachments, setUploadingAttachments] = useState(0);
+  /** 默认接收人变更跟踪器：变更序列化、在途拦截与过期响应判定（Dot 0092 第 1 项）。 */
+  const defaultAgentChangeTrackerRef = useRef(createDefaultAgentChangeTracker());
+  const [defaultAgentChangeRenderTick, setDefaultAgentChangeRenderTick] = useState(0);
   const [isRefreshingRuntimes, setIsRefreshingRuntimes] = useState(false);
   const [isSwitchingInteractionMode, setIsSwitchingInteractionMode] = useState(false);
   const [showInteractionModeMenu, setShowInteractionModeMenu] = useState(false);
@@ -479,6 +483,16 @@ export function App() {
   const lastDirectAgentLabel = state.conversation.lastDirectAgentId
     ? agentsById.get(state.conversation.lastDirectAgentId)?.label
     : undefined;
+  // 默认接收人变更在途状态（Dot 0092 第 1 项）：渲染态用于禁用下拉与发送
+  // 按钮并展示「保存中」提示；发送前的权威拦截在 sendMessage 里读跟踪器
+  // 的同步状态，不依赖渲染时序。
+  const defaultAgentChangePending = useMemo(
+    () => defaultAgentChangeTrackerRef.current.isChangePending({
+      workspaceId: state.workspace.id,
+      conversationId: state.conversation.id,
+    }),
+    [defaultAgentChangeRenderTick, state.workspace.id, state.conversation.id],
+  );
   const scrollKey = useMemo(
     () =>
       state.messages
@@ -811,6 +825,16 @@ export function App() {
       window.setTimeout(() => setAttachmentToast(null), 3000);
       return;
     }
+    // 权威拦截：默认接收人变更未确认时不允许发送，否则消息会按尚未
+    // 确认的旧接收人路由（Dot 0092 第 1 项；同步在途状态，不依赖渲染时序）。
+    if (!defaultAgentChangeTrackerRef.current.canSend({
+      workspaceId: state.workspace.id,
+      conversationId: state.conversation.id,
+    })) {
+      setAttachmentToast("接收人正在保存中，请稍候再发送");
+      window.setTimeout(() => setAttachmentToast(null), 3000);
+      return;
+    }
     const trimmed = content.trim();
     if (!canSendMessage(trimmed, pendingAttachments.length) || isSending || isSwitchingInteractionMode) {
       return;
@@ -959,6 +983,22 @@ export function App() {
   async function updateDefaultDirectAgent(agentId: string) {
     const conversationId = state.conversation.id;
     if (!conversationId) return;
+    // 变更序列化并绑定发起时的上下文快照（Dot 0092 第 1 项）：同一会话
+    // 已有在途变更时忽略本次变更；响应到达时只有仍停留在发起会话才
+    // 应用，迟到、乱序或已切换会话的过期结果一律丢弃。
+    const tracker = defaultAgentChangeTrackerRef.current;
+    const request = tracker.beginChange({ workspaceId: state.workspace.id, conversationId });
+    if (!request) return;
+    setDefaultAgentChangeRenderTick((tick) => tick + 1);
+    // 响应到达时的当前页面上下文：URL 未带会话 id 时视为未切换会话
+    // （与 sendMessage 的 stillOnSamePage 判定一致）。
+    const responseContext = (): { workspaceId: string; conversationId: string } => {
+      const pageContext = readPageContext(window.location.search);
+      return {
+        workspaceId: pageContext.workspaceId,
+        conversationId: pageContext.conversationId || request.conversationId,
+      };
+    };
     try {
       const response = await fetch(withPageContext(`/api/conversations/${conversationId}/default-agent`, currentPageContext()), {
         method: "PUT",
@@ -967,9 +1007,14 @@ export function App() {
       });
       const body = await response.json() as { conversation?: ConversationInfo; message?: string };
       if (!response.ok || !body.conversation) throw new Error(body.message ?? "默认接收员工设置失败");
+      if (!tracker.finishChange(request, responseContext())) return;
       setState((current) => ({ ...current, conversation: body.conversation! }));
     } catch (error) {
+      // 过期的失败同样丢弃：不在已切换到的新会话里冒充本会话的错误。
+      if (!tracker.finishChange(request, responseContext())) return;
       setState((current) => ({ ...current, messages: [...current.messages, createLocalSystemMessage(error instanceof Error ? error.message : "默认接收员工设置失败")] }));
+    } finally {
+      setDefaultAgentChangeRenderTick((tick) => tick + 1);
     }
   }
 
@@ -2216,13 +2261,14 @@ export function App() {
                     aria-label="默认接收员工"
                     value={state.conversation.lastDirectAgentId ?? ""}
                     onChange={(event) => { void updateDefaultDirectAgent(event.target.value); }}
-                    disabled={!hasWorkspace || !hasEnabledAgent}
+                    disabled={!hasWorkspace || !hasEnabledAgent || defaultAgentChangePending}
                   >
                     <option value="">未指定（需 @）</option>
                     {state.agents.filter((agent) => agent.id !== INTERNAL_SUPERVISOR_ID).map((agent) => (
                       <option key={agent.id} value={agent.id}>{agent.label}</option>
                     ))}
                   </select>
+                  {defaultAgentChangePending ? <span className="defaultReceiverPending">保存中…</span> : null}
                 </label>
               ) : null}
               <div className="approvalModeControl">
@@ -2282,10 +2328,10 @@ export function App() {
               type="submit"
               theme="primary"
               icon={<SendIcon />}
-              disabled={!hasWorkspace || !hasEnabledAgent || !canSendMessage(content, pendingAttachments.length) || isSending || isSwitchingInteractionMode || uploadingAttachments > 0}
-              title={uploadingAttachments > 0 ? "附件上传中，完成后可发送" : undefined}
+              disabled={!hasWorkspace || !hasEnabledAgent || !canSendMessage(content, pendingAttachments.length) || isSending || isSwitchingInteractionMode || uploadingAttachments > 0 || defaultAgentChangePending}
+              title={defaultAgentChangePending ? "接收人保存中，完成后可发送" : uploadingAttachments > 0 ? "附件上传中，完成后可发送" : undefined}
             >
-              {isSending ? <span className="sendSpinner" aria-hidden="true" /> : uploadingAttachments > 0 ? "上传中…" : "发送"}
+              {isSending ? <span className="sendSpinner" aria-hidden="true" /> : uploadingAttachments > 0 ? "上传中…" : defaultAgentChangePending ? "保存中…" : "发送"}
             </Button>
             </div>
           </div>

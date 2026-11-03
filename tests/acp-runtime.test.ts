@@ -542,8 +542,9 @@ test("stdout EOF rejects pending ACP requests and marks the connection dead", { 
 
 test("an unrecoverable resume failure falls back to a fresh session", async () => {
   // Issue #141：thread-store conflict / active writer 表明原会话状态已不可
-  // 用，必须在同一条连接上直接新建会话，sessionId 落定新值并输出过程提示。
-  const output: string[] = [];
+  // 用，必须在同一条连接上直接新建会话，sessionId 落定新值。降级提示必须
+  // 走过程叙述流（process.text）在持久时间线留痕，而不是只走 onOutput。
+  const notices: string[] = [];
   const fake = fakeConnector({
     resumeCapability: true,
     answerText: "答复文本",
@@ -552,7 +553,7 @@ test("an unrecoverable resume failure falls back to a fresh session", async () =
   const handle = runAcp(
     runOptions({
       resumeSessionId: "old-session",
-      onOutput: (text: string) => output.push(text),
+      onActivity: (activity: AgentActivityEvent) => { if (activity.type === "process.text") notices.push(activity.text); },
     }),
     definition,
     fake.connector,
@@ -565,14 +566,14 @@ test("an unrecoverable resume failure falls back to a fresh session", async () =
   assert.ok(fake.calls.includes("session/new:1"), "不可恢复失败必须新建会话");
   assert.ok(fake.calls.includes("session/prompt:fake-session"), "新建会话后 prompt 必须使用新 id");
   assert.equal(fake.spawnCount, 1, "不可恢复降级不换连接");
-  assert.ok(output.some((text) => text.includes("已使用新的会话继续")), `expected downgrade notice in: ${output.join(" | ")}`);
-  assert.ok(output.some((text) => text.includes("thread-store conflict")), `expected failure summary in: ${output.join(" | ")}`);
+  assert.ok(notices.some((text) => text.includes("已重建新会话")), `expected persisted downgrade notice in: ${notices.join(" | ")}`);
+  assert.ok(notices.some((text) => text.includes("thread-store conflict")), `expected failure summary in: ${notices.join(" | ")}`);
 });
 
-test("an opaque internal-error resume failure falls back to a fresh session", async () => {
-  // 实测复现（2026-11-03）：Orbit 重启后，dsh 既有会话在新进程里 resume
-  // 被以 JSON-RPC -32603 "Internal error" 拒绝；分类器此前不认这类错误，
-  // 整轮在会话建立阶段以裸 Internal error 失败。按不可恢复降级新建会话。
+test("an opaque internal-error resume failure retries the same session on a fresh connection", async () => {
+  // Dot 0092 第 2 项收窄：泛化内部错误（实测 dsh 跨进程 resume 返回 -32603
+  // "Internal error"）单次出现不足以证明会话失效——先销毁当前连接、用
+  // 同一个 sessionId 在新连接上重试；重试成功即恢复原会话，不降级。
   const output: string[] = [];
   const fake = fakeConnector({
     resumeCapability: true,
@@ -590,12 +591,69 @@ test("an opaque internal-error resume failure falls back to a fresh session", as
 
   const answer = await handle.result;
   assert.equal(answer, "答复文本");
-  assert.equal(await handle.sessionId, "fake-session", "降级后 sessionId 必须落定新会话的 id");
-  assert.ok(fake.calls.includes("session/resume:1:old-session"), "恢复失败前必须先尝试 resume");
-  assert.ok(fake.calls.includes("session/new:1"), "内部错误拒绝恢复必须新建会话");
-  assert.ok(fake.calls.includes("session/prompt:fake-session"), "新建会话后 prompt 必须使用新 id");
-  assert.equal(fake.spawnCount, 1, "不可恢复降级不换连接");
-  assert.ok(output.some((text) => text.includes("已使用新的会话继续")), "expected downgrade notice in output");
+  assert.equal(await handle.sessionId, "old-session", "重试成功必须保留原 sessionId，不得降级");
+  assert.equal(fake.spawnCount, 2, "证据不足时必须先换连接重试同一绑定");
+  assert.ok(fake.calls.includes("destroy:1"), "旧 lease 必须先销毁");
+  assert.ok(fake.calls.includes("session/resume:2:old-session"), "重试必须在新连接上用同一个 sessionId resume");
+  assert.ok(fake.calls.includes("session/prompt:old-session"));
+  assert.ok(!fake.calls.some((call) => call.startsWith("session/new:")), "单次泛化错误不得新建会话");
+  assert.ok(output.some((text) => text.includes("已在新连接上恢复原会话")), `expected retry notice in: ${output.join(" | ")}`);
+});
+
+test("an opaque internal error rejected on both connections downgrades with a persisted notice", async () => {
+  // 同一绑定在两条连接上被同类错误接连拒绝，才构成「原会话确已失效」的
+  // 实据（含 2026-11-03 实测的 dsh 跨进程场景：每个新进程都不认识旧会话，
+  // 必然连续拒绝）——此时按不可恢复降级新建会话，且提示必须走过程叙述
+  // 流在持久时间线留痕。新会话收到的 prompt 与全新会话完全相同（同一份
+  // options.prompt），上下文组装不因降级而缺失。
+  const notices: string[] = [];
+  const fake = fakeConnector({
+    resumeCapability: true,
+    answerText: "答复文本",
+    resumeError: Object.assign(new Error("Internal error"), { code: -32603 }),
+    secondResumeError: Object.assign(new Error("Internal error"), { code: -32603 }),
+  });
+  const handle = runAcp(
+    runOptions({
+      resumeSessionId: "old-session",
+      onActivity: (activity: AgentActivityEvent) => { if (activity.type === "process.text") notices.push(activity.text); },
+    }),
+    definition,
+    fake.connector,
+  );
+
+  const answer = await handle.result;
+  assert.equal(answer, "答复文本");
+  assert.equal(await handle.sessionId, "fake-session-2", "两次拒绝后降级，sessionId 落定新连接上的新会话");
+  assert.equal(fake.spawnCount, 2, "降级发生在重试的新连接上，不再另换连接");
+  assert.ok(fake.calls.includes("session/resume:2:old-session"), "降级前必须先在新连接上重试同一绑定");
+  assert.ok(fake.calls.includes("session/new:2"), "两次同类拒绝后必须新建会话");
+  assert.ok(fake.calls.includes("session/prompt:fake-session-2"), "新建会话后 prompt 必须使用新 id");
+  assert.deepEqual(fake.prompts.length, 1, "降级后只发送本轮同一份 prompt");
+  assert.ok(notices.some((text) => text.includes("已重建新会话")), `expected persisted downgrade notice in: ${notices.join(" | ")}`);
+  assert.ok(notices.some((text) => text.includes("Internal error")), `expected failure summary in: ${notices.join(" | ")}`);
+});
+
+test("an opaque internal error followed by an unrelated retry failure settles as a normal error", async () => {
+  // 证据不足 + 重试以其他方式（传输中断）失败：不构成会话失效实据，
+  // 按普通错误落定，不新建会话、不改绑定，留待主人下一条消息决定。
+  const fake = fakeConnector({
+    resumeCapability: true,
+    resumeError: Object.assign(new Error("Internal error"), { code: -32603 }),
+    secondResumeError: new Error("Fake Agent ACP transport closed (stdout ended while pid 2 was still running)."),
+  });
+  const handle = runAcp(
+    runOptions({ resumeSessionId: "old-session" }),
+    definition,
+    fake.connector,
+  );
+
+  await assert.rejects(handle.result, (error: unknown) => {
+    assert.match((error as Error).message, /transport closed/);
+    return true;
+  });
+  assert.equal(fake.spawnCount, 2, "只允许重试一次");
+  assert.ok(!fake.calls.some((call) => call.startsWith("session/new:")), "证据不足时不得降级新建会话");
 });
 
 test("a recoverable resume failure retries the same session id on a fresh connection", async () => {
