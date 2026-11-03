@@ -46,9 +46,9 @@
 | 思考强度支持（CodeBuddy 思考档位、dsh 推理强度、Codex 模型变体选择） | `feat/reasoning-effort` | 已合入本地生产线 |
 | 新增 WorkBuddy 运行时 | `feat/workbuddy-runtime` | 已合入本地生产线（运行时保留；用户工作区已不设该席位） |
 | 出厂模板改为三席标准（员工本名、提示词精简、dsh 默认模型偏好） | `feat/template-defaults` | 已合入本地生产线 |
-| Codex 适配器升级（codex-acp 2.5.0，可选模型扩展到 GPT-6.x 系列） | 本地分支 `feat/codex-acp-upgrade` | 已合入本地生产线，尚未推到 fork |
-| dsh 员工身份让位（身份以其自身系统配置为准） | 本地分支 `feat/dsh-identity-defer` | 已合入本地生产线，尚未推到 fork |
-| 监工默认改挂 Codex（隐式运行时选择顺序调整） | 本地分支 `feat/supervisor-default` | 已合入本地生产线，尚未推到 fork |
+| Codex 适配器升级（codex-acp 2.5.0，可选模型扩展到 GPT-6.x 系列） | 分支 `feat/codex-acp-upgrade` | 已合入本地生产线，已推到 fork（快照 `884816a4`） |
+| dsh 员工身份让位（身份以其自身系统配置为准） | 分支 `feat/dsh-identity-defer` | 已合入本地生产线，已推到 fork（快照 `5f8ab86a`） |
+| 监工默认改挂 Codex（隐式运行时选择顺序调整） | 分支 `feat/supervisor-default` | 已合入本地生产线，已推到 fork（快照 `079e248d`） |
 | 可配置数据根与离线验收驱动 | 本地分支 `feat/orbit-data-root` | 未合入、未部署（离线成果） |
 | ACP 会话替换后恢复有界对话历史 | `fix/session-continuity-main` | 2026-11-03 在本机产生并推入 fork；经手席位待确认 |
 

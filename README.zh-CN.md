@@ -20,7 +20,7 @@
 
 > **关于这个 fork，先看这里。**
 > 本仓库是上游项目 [kevinforge/orbit](https://github.com/kevinforge/orbit) 的 **fork**，基线是上游 **v1.4.0**。上游作者归属与 MIT 许可证原样保留（见根目录 `LICENSE`）。本 fork 改了什么、与上游有哪些现状差异，写在 [docs/PROJECT-ORIGIN.md](docs/PROJECT-ORIGIN.md) 和 [docs/FORK-STATUS.md](docs/FORK-STATUS.md) 里。
-> 本 README 其余部分的安装、发布与支持说明，描述的是**上游**项目及其已发布软件包。本 fork 不发布版本；实际在用的版本是未经发布的本地维护版本。
+> 本 README 其余部分的安装、发布与支持说明，描述的是**上游**项目及其已发布软件包。截至 2026-11-03 盘点时（见 docs/FORK-STATUS.md），本 fork 不发布版本；实际在用的版本是未经发布的本地维护版本。
 
 ## Orbit 是什么
 

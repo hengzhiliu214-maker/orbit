@@ -20,7 +20,7 @@
 
 > **About this fork - please read first.**
 > This repository is a **fork** of the upstream project [kevinforge/orbit](https://github.com/kevinforge/orbit), based on upstream **v1.4.0**. The upstream authorship and the MIT license are preserved unchanged (see `LICENSE`). What this fork changes, and how its current state differs from upstream, is documented in [docs/PROJECT-ORIGIN.md](docs/PROJECT-ORIGIN.md) and [docs/FORK-STATUS.md](docs/FORK-STATUS.md).
-> The installation, release and support instructions in the rest of this README describe the **upstream** project and its published packages. This fork publishes no releases; the version in production use here is an unreleased, locally maintained build.
+> The installation, release and support instructions in the rest of this README describe the **upstream** project and its published packages. As of the 2026-11-03 inventory (see docs/FORK-STATUS.md), this fork publishes no releases; the version in production use here is an unreleased, locally maintained build.
 
 ## What Orbit is
 
