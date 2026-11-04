@@ -7,13 +7,15 @@ import { INTERNAL_SUPERVISOR_ID } from "../core/agent-profiles.ts";
 import { matchAssignmentPrefix } from "../core/mention-router.ts";
 import { resolveSlashCommandTarget } from "../core/native-commands.ts";
 import { matchPreset } from "../core/workspace-presets.ts";
-import { type AgentActivityEvent, type AgentCommand, type AgentCommandsSnapshot, type AgentConfig, type AgentConfigWithModelState, type AgentId, type AgentModelPreference, type AgentModelProbeResponse, type AgentModelProbeState, type AgentModelStateSnapshot, type AgentPlanSnapshot, type AgentRuntimeKind, type AgentState, type AgentTeamTemplate, type AppState, type ApprovalMode, type ChatMessage, type Conversation, type ConversationInfo, type DraftAttachmentInfo, type ElicitationContent, type ElicitationFieldSchema, type ElicitationResponse, type InteractionMode, type MessagePage, type PendingElicitation, type PendingPermission, type PermissionDecision, type PersistedProcessTimelineEntry, type RunningSummary, type RuntimeEvent, type SupervisorConfig, type Workspace, type WorkspacePreset, ATTACHMENT_LIMITS } from "../shared/types.ts";
+import { type AgentActivityEvent, type AgentCommand, type AgentCommandsSnapshot, type AgentConfig, type AgentConfigWithModelState, type AgentId, type AgentModelChoice, type AgentModelPreference, type AgentModelProbeResponse, type AgentModelProbeState, type AgentModelStateSnapshot, type AgentPlanSnapshot, type AgentRuntimeKind, type AgentState, type AgentTeamTemplate, type AppState, type ApprovalMode, type ChatMessage, type Conversation, type ConversationInfo, type DraftAttachmentInfo, type ElicitationContent, type ElicitationFieldSchema, type ElicitationResponse, type InteractionMode, type MessagePage, type PendingElicitation, type PendingPermission, type PermissionDecision, type PersistedProcessTimelineEntry, type RunningSummary, type RuntimeEvent, type SupervisorConfig, type Workspace, type WorkspacePreset, ATTACHMENT_LIMITS } from "../shared/types.ts";
 import { attachmentAcceptAttribute } from "../shared/attachment-registry.ts";
 import { canSendMessage } from "../shared/message-validation.ts";
 import { createAttachmentUploadLifecycle } from "./attachment-upload-state.ts";
+import { createDefaultAgentChangeTracker, type DefaultAgentChangeRequest } from "./default-agent-change-state.ts";
 import { createConversationForUpload } from "./attachment-upload-conversation.ts";
 import { appendTransientProcessActivity, collapseToolExecutions, type ProcessToolActivity, type ProcessToolExecution } from "../shared/process-activity.ts";
 import { WorkAnalysisPanel } from "./WorkAnalysisPanel.tsx";
+import { GraphPanel } from "./GraphPanel.tsx";
 import { FilePreviewPanel } from "./FilePreviewPanel.tsx";
 import * as TDesign from "tdesign-react";
 import {
@@ -109,6 +111,20 @@ function loadActiveView(): ActiveView {
   }
 }
 
+const GRAPH_PANEL_STORAGE_KEY = "orbit.graphPanelVisible";
+
+export function resolveGraphPanelVisible(stored: string | null): boolean {
+  return stored !== "hidden";
+}
+
+function loadGraphPanelVisible(): boolean {
+  try {
+    return resolveGraphPanelVisible(window.localStorage.getItem(GRAPH_PANEL_STORAGE_KEY));
+  } catch {
+    return true;
+  }
+}
+
 export function resolveApprovalMode(storedMode: string | null): ApprovalMode {
   return storedMode === "ask" ? "ask" : "full-access";
 }
@@ -134,6 +150,9 @@ export function isImeComposition(event: { nativeEvent: { isComposing?: boolean }
 export function App() {
   const [state, setState] = useState<AppState>(initialState);
   const [activeView, setActiveView] = useState<ActiveView>(loadActiveView);
+  const [graphPanelVisible, setGraphPanelVisible] = useState<boolean>(loadGraphPanelVisible);
+  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
+  const highlightTimerRef = useRef<number | null>(null);
   const [content, setContent] = useState("");
   const [approvalMode, setApprovalMode] = useState<ApprovalMode>(loadApprovalMode);
   const [showApprovalModeMenu, setShowApprovalModeMenu] = useState(false);
@@ -200,6 +219,9 @@ export function App() {
   /** 附件上传生命周期：上下文版本绑定的上传计数与附件槽位（PR #147 M1 竞态修复）。 */
   const attachmentUploadLifecycleRef = useRef(createAttachmentUploadLifecycle());
   const [uploadingAttachments, setUploadingAttachments] = useState(0);
+  /** 默认接收人变更跟踪器：变更序列化、在途拦截与过期响应判定（Dot 0092 第 1 项）。 */
+  const defaultAgentChangeTrackerRef = useRef(createDefaultAgentChangeTracker());
+  const [defaultAgentChangeRenderTick, setDefaultAgentChangeRenderTick] = useState(0);
   const [isRefreshingRuntimes, setIsRefreshingRuntimes] = useState(false);
   const [isSwitchingInteractionMode, setIsSwitchingInteractionMode] = useState(false);
   const [showInteractionModeMenu, setShowInteractionModeMenu] = useState(false);
@@ -225,6 +247,14 @@ export function App() {
       // The view still works when storage is unavailable; only reload persistence is lost.
     }
   }, [activeView]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(GRAPH_PANEL_STORAGE_KEY, graphPanelVisible ? "visible" : "hidden");
+    } catch {
+      // Same trade-off as the view persistence above.
+    }
+  }, [graphPanelVisible]);
 
   useEffect(() => {
     try {
@@ -279,6 +309,13 @@ export function App() {
           || pageContext.workspaceId !== requestedContext.workspaceId
           || pageContext.conversationId !== requestedContext.conversationId) return;
         setState(normalizeState(nextState));
+        // 结果不确定的默认接收人变更（Dot 0096）：刷新带来的状态可能
+        // 是 PUT 提交前读到的旧值，不得凭一次刷新直接解锁确认中变更；
+        // 刷新只触发一次操作状态确认，由服务端操作记录裁决终结。
+        const confirming = defaultAgentChangeTrackerRef.current.confirmingRequest(requestedContext);
+        if (confirming) {
+          void confirmDefaultAgentOperation(confirming);
+        }
       })
       .catch(() => setConnectionState("offline"));
   };
@@ -473,12 +510,39 @@ export function App() {
   }, [state.agents, supervisorConfig.runtime]);
   const messagesById = useMemo(() => new Map(state.messages.map((message) => [message.id, message])), [state.messages]);
   const visibleMessages = useMemo(() => state.messages.filter((message) => !message.discarded), [state.messages]);
+  // 指令链面板的实时签名：消息集合或任一消息的运行状态变化即触发面板防抖重拉。
+  const graphLiveSignature = useMemo(() => {
+    let hash = state.messages.length;
+    for (const message of state.messages) {
+      const token = `${message.id}:${message.runStatus ?? ""}:${message.status ?? ""}:${message.completedAt ?? ""};`;
+      for (let i = 0; i < token.length; i++) hash = (hash * 31 + token.charCodeAt(i)) | 0;
+    }
+    return `${state.conversation.id}:${hash}`;
+  }, [state.messages, state.conversation.id]);
   const agentIds = useMemo(() => state.agents.map((agent) => agent.id), [state.agents]);
   const hasEnabledAgent = agentIds.length > 0;
   const interactionMode: InteractionMode = state.conversation.interactionMode ?? "direct";
   const lastDirectAgentLabel = state.conversation.lastDirectAgentId
     ? agentsById.get(state.conversation.lastDirectAgentId)?.label
     : undefined;
+  // 默认接收人变更在途状态（Dot 0092 第 1 项）：渲染态用于禁用下拉与发送
+  // 按钮并展示「保存中」提示；发送前的权威拦截在 sendMessage 里读跟踪器
+  // 的同步状态，不依赖渲染时序。
+  const defaultAgentChangePending = useMemo(
+    () => defaultAgentChangeTrackerRef.current.isChangePending({
+      workspaceId: state.workspace.id,
+      conversationId: state.conversation.id,
+    }),
+    [defaultAgentChangeRenderTick, state.workspace.id, state.conversation.id],
+  );
+  // 确认中阶段（Dot 0094）：PUT 结果不确定、正在重读确认，文案与保存中区分。
+  const defaultAgentChangeConfirming = useMemo(
+    () => defaultAgentChangeTrackerRef.current.isChangeConfirming({
+      workspaceId: state.workspace.id,
+      conversationId: state.conversation.id,
+    }),
+    [defaultAgentChangeRenderTick, state.workspace.id, state.conversation.id],
+  );
   const scrollKey = useMemo(
     () =>
       state.messages
@@ -811,6 +875,16 @@ export function App() {
       window.setTimeout(() => setAttachmentToast(null), 3000);
       return;
     }
+    // 权威拦截：默认接收人变更未确认时不允许发送，否则消息会按尚未
+    // 确认的旧接收人路由（Dot 0092 第 1 项；同步在途状态，不依赖渲染时序）。
+    if (!defaultAgentChangeTrackerRef.current.canSend({
+      workspaceId: state.workspace.id,
+      conversationId: state.conversation.id,
+    })) {
+      setAttachmentToast("接收人正在保存中，请稍候再发送");
+      window.setTimeout(() => setAttachmentToast(null), 3000);
+      return;
+    }
     const trimmed = content.trim();
     if (!canSendMessage(trimmed, pendingAttachments.length) || isSending || isSwitchingInteractionMode) {
       return;
@@ -953,6 +1027,162 @@ export function App() {
     } finally {
       setIsSwitchingInteractionMode(false);
     }
+  }
+
+
+  async function updateDefaultDirectAgent(agentId: string) {
+    const conversationId = state.conversation.id;
+    if (!conversationId) return;
+    // 变更序列化并绑定发起时的上下文快照（Dot 0092 第 1 项）：同一会话
+    // 已有在途变更时忽略本次变更；响应到达时只有仍停留在发起会话才
+    // 应用，迟到、乱序或已切换会话的过期结果一律丢弃。
+    const tracker = defaultAgentChangeTrackerRef.current;
+    const request = tracker.beginChange({ workspaceId: state.workspace.id, conversationId });
+    if (!request) return;
+    setDefaultAgentChangeRenderTick((tick) => tick + 1);
+    // 响应到达时的当前页面上下文：URL 未带会话 id 时视为未切换会话
+    // （与 sendMessage 的 stillOnSamePage 判定一致）。
+    const responseContext = (): { workspaceId: string; conversationId: string } => {
+      const pageContext = readPageContext(window.location.search);
+      return {
+        workspaceId: pageContext.workspaceId,
+        conversationId: pageContext.conversationId || request.conversationId,
+      };
+    };
+    // 结果分类（Dot 0094 + 0096）：只有「成功且带回 conversation、且
+    // 操作状态为 committed」与「4xx 且带 JSON 错误体」是确定结果
+    //（4xx 的可信度由服务端终结屏障背书：变更串行执行、持久化失败
+    // 回滚内存并记 failed）。网络失败、响应解析失败、5xx 或成功响应
+    // 缺少 conversation / 操作状态都属于不确定——服务端可能已经提交
+    // 切换，按确定失败解锁回旧值会让界面显示旧接收人而服务器已切换、
+    // 消息错发。
+    let settled = false;
+    try {
+      const response = await fetch(withPageContext(`/api/conversations/${conversationId}/default-agent`, currentPageContext()), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ agentId: agentId === "" ? null : agentId, operationId: request.operationId }),
+      });
+      let body: { conversation?: ConversationInfo; message?: string; operation?: { status?: string } | null } | null = null;
+      try {
+        body = await response.json() as { conversation?: ConversationInfo; message?: string; operation?: { status?: string } | null };
+      } catch {
+        body = null;
+      }
+      if (response.ok && body?.conversation && body.operation?.status === "committed") {
+        settled = true;
+        if (!tracker.finishChange(request, responseContext())) return;
+        setState((current) => ({ ...current, conversation: body.conversation! }));
+        return;
+      }
+      if (!response.ok && response.status >= 400 && response.status < 500 && body?.message) {
+        // 确定失败：解锁回旧值并提示（过期的失败同样丢弃，不在新会话冒充）。
+        settled = true;
+        if (!tracker.finishChange(request, responseContext())) return;
+        setState((current) => ({ ...current, messages: [...current.messages, createLocalSystemMessage(body?.message ?? "默认接收员工设置失败")] }));
+        return;
+      }
+    } catch {
+      // 网络失败：没有任何响应，结果不确定，走下方确认流程。
+    } finally {
+      setDefaultAgentChangeRenderTick((tick) => tick + 1);
+    }
+    if (settled) return;
+    // 不确定路径：转入确认中阶段（继续阻断发送），改由操作状态确认
+    // 裁决终结（Dot 0096）：凭 operationId 查服务端操作记录，
+    // committed / failed 才解锁；单次重读不再直接裁决，绝不猜测
+    // 结果、绝不回旧值解锁。
+    if (!tracker.markUncertain(request)) return;
+    setDefaultAgentChangeRenderTick((tick) => tick + 1);
+    await confirmDefaultAgentOperation(request);
+  }
+
+  /**
+   * 确认中变更的操作状态确认（Dot 0096 终结屏障）：凭 operationId 向
+   * 服务端查询该次变更的操作记录，以终结状态裁决解锁，不再以单次
+   * 重读的值裁决（重读可能读到 PUT 提交前的值、PUT 随后才提交）。
+   * - committed：已终结且已提交——再读一次状态把提交后的会话应用到
+   *   界面（该操作已终结，不存在仍在途的同一 PUT，读回即终局状态）；
+   * - failed：已终结且未提交——解锁回旧值并提示失败原因；
+   * - pending：继续等（有限次轮询，间隔 800ms）；
+   * - 记录查不到（operation 为 null）：服务端已重启，在途 PUT 随旧
+   *   进程消亡、不可能再提交——改以状态重读值作为终局权威值解锁
+   *   （resolveWithReread 的唯一适用场景）；
+   * - 轮询预算耗尽仍未终结：保持确认态（发送继续阻断），等后续状态
+   *   刷新再次触发确认，绝不猜测结果。
+   */
+  async function confirmDefaultAgentOperation(request: DefaultAgentChangeRequest): Promise<void> {
+    const tracker = defaultAgentChangeTrackerRef.current;
+    const responseContext = (): { workspaceId: string; conversationId: string } => {
+      const pageContext = readPageContext(window.location.search);
+      return {
+        workspaceId: pageContext.workspaceId,
+        conversationId: pageContext.conversationId || request.conversationId,
+      };
+    };
+    const targetContext = { workspaceId: request.workspaceId, conversationId: request.conversationId };
+    const readState = async (): Promise<AppState | null> => {
+      try {
+        const stateResponse = await fetch(withPageContext("/api/state", targetContext));
+        if (!stateResponse.ok) return null;
+        const nextState = await stateResponse.json() as AppState;
+        return nextState.conversation?.id === request.conversationId ? nextState : null;
+      } catch {
+        return null;
+      }
+    };
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 800));
+      let operation: { status?: string; message?: string } | null = null;
+      let parsed = false;
+      try {
+        const opResponse = await fetch(withPageContext(
+          `/api/conversations/${request.conversationId}/default-agent-operation?operationId=${encodeURIComponent(request.operationId)}`,
+          targetContext,
+        ));
+        if (opResponse.ok) {
+          const opBody = await opResponse.json() as { operation?: { status?: string; message?: string } | null };
+          if (opBody.operation !== undefined) {
+            operation = opBody.operation;
+            parsed = true;
+          }
+        }
+      } catch {
+        // 查询失败：保持确认态，按有限重试再试。
+      }
+      if (!parsed) continue;
+      if (operation === null) {
+        const nextState = await readState();
+        if (!nextState) continue;
+        if (!tracker.resolveWithReread(request, responseContext())) return;
+        setState(normalizeState(nextState));
+        setDefaultAgentChangeRenderTick((tick) => tick + 1);
+        return;
+      }
+      if (operation.status === "pending") continue;
+      if (operation.status === "committed") {
+        const nextState = await readState();
+        if (!nextState) continue;
+        if (!tracker.resolveWithOperation(request, responseContext())) return;
+        setState(normalizeState(nextState));
+        setDefaultAgentChangeRenderTick((tick) => tick + 1);
+        return;
+      }
+      if (operation.status === "failed") {
+        if (!tracker.resolveWithOperation(request, responseContext())) return;
+        setState((current) => ({
+          ...current,
+          messages: [...current.messages, createLocalSystemMessage(operation.message ?? "默认接收员工设置失败")],
+        }));
+        setDefaultAgentChangeRenderTick((tick) => tick + 1);
+        return;
+      }
+    }
+    // 轮询预算内未确认：保持确认态阻断发送，明确提示结果未确认。
+    if (responseContext().conversationId === request.conversationId) {
+      setState((current) => ({ ...current, messages: [...current.messages, createLocalSystemMessage("默认接收员工的设置结果未能确认（可能已保存成功）：发送已暂停，等待状态刷新确认后恢复，请勿按旧接收人继续发送。")] }));
+    }
+    setDefaultAgentChangeRenderTick((tick) => tick + 1);
   }
 
   async function resolvePermission(requestId: string, decision: PermissionDecision) {
@@ -1239,6 +1469,37 @@ export function App() {
       setState((current) => mergeOlderMessagesPage(current, requestContext, page));
     } finally {
       setIsLoadingOlderMessages(false);
+    }
+  }
+
+  // 指令链节点点击定位：目标消息可能尚未加载（在更早的分页里），逐页向前
+  // 加载直到 DOM 出现该消息锚点；游标在本函数内推进，避免依赖渲染期状态。
+  async function revealMessage(messageId: string) {
+    const requestContext = {
+      workspaceId: state.workspace.id,
+      conversationId: state.conversation.id,
+    };
+    let cursor = state.messageHistory.olderCursor;
+    for (let attempt = 0; attempt < 24; attempt++) {
+      const element = document.getElementById(`orbit-msg-${messageId}`);
+      if (element) {
+        element.scrollIntoView({ block: "center", behavior: "smooth" });
+        setHighlightedMessageId(messageId);
+        if (highlightTimerRef.current !== null) window.clearTimeout(highlightTimerRef.current);
+        highlightTimerRef.current = window.setTimeout(() => setHighlightedMessageId(null), 2400);
+        return;
+      }
+      if (!cursor) return;
+      try {
+        const response = await fetch(withPageContext(`/api/messages?before=${encodeURIComponent(cursor)}&limit=50`, requestContext));
+        if (!response.ok) return;
+        const page = (await response.json()) as MessagePage;
+        cursor = page.olderCursor;
+        setState((current) => mergeOlderMessagesPage(current, requestContext, page));
+      } catch {
+        return;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 80));
     }
   }
 
@@ -1625,10 +1886,11 @@ export function App() {
   // 预览面板作为第三栏（previewOpen 类，宽度由 styles.css 定义）；窄视口
   // （≤920px）下不挂类，面板转为浮层，不占用网格列。
   const previewColumnActive = previewPath !== null && !isCompactViewport;
+  const graphColumnActive = graphPanelVisible && activeView === "conversation" && !isCompactViewport;
 
   return (
     <main
-      className={`shell ${sidebarCollapsed ? "sidebarCollapsed" : ""}${previewColumnActive ? " previewOpen" : ""}`}
+      className={`shell ${sidebarCollapsed ? "sidebarCollapsed" : ""}${previewColumnActive ? " previewOpen" : ""}${graphColumnActive ? " graphOpen" : ""}`}
       style={{
         gridTemplateColumns: sidebarCollapsed ? "0 minmax(0, 1fr)" : `${sidebarWidth}px minmax(0, 1fr)`,
         "--sidebar-resize-left": `${sidebarWidth}px`,
@@ -1895,6 +2157,15 @@ export function App() {
             {state.workspace.path ? <p className="workspacePath" title={state.workspace.path}>{state.workspace.path}</p> : null}
           </div>
           <div className="conversationHeaderRight">
+            <button
+              type="button"
+              className={`graphToggleBtn ${graphPanelVisible ? "active" : ""}`}
+              onClick={() => setGraphPanelVisible((visible) => !visible)}
+              title={graphPanelVisible ? "隐藏指令链面板" : "显示指令链面板"}
+              aria-pressed={graphPanelVisible}
+            >
+              指令链
+            </button>
             <Avatar.Group size="28px" max={4}>
               {state.agents.map((agent) => <Avatar key={agent.id} style={{ backgroundColor: agentColor(agent.id) }}>{agent.label.slice(0, 1)}</Avatar>)}
             </Avatar.Group>
@@ -1951,6 +2222,7 @@ export function App() {
                 agent={message.agentId ? agentsById.get(message.agentId) : undefined}
                 parentMessage={message.parentMessageId ? messagesById.get(message.parentMessageId) : undefined}
                 agentsById={agentsById}
+                highlighted={highlightedMessageId === message.id}
               />
             ))
           )}
@@ -2191,6 +2463,23 @@ export function App() {
                   </div>
                 ) : null}
               </div>
+              {interactionMode === "direct" ? (
+                <label className="defaultReceiverControl" title="普通对话下不带 @ 的消息固定发给这位员工">
+                  <span>发送给</span>
+                  <select
+                    aria-label="默认接收员工"
+                    value={state.conversation.lastDirectAgentId ?? ""}
+                    onChange={(event) => { void updateDefaultDirectAgent(event.target.value); }}
+                    disabled={!hasWorkspace || !hasEnabledAgent || defaultAgentChangePending}
+                  >
+                    <option value="">未指定（需 @）</option>
+                    {state.agents.filter((agent) => agent.id !== INTERNAL_SUPERVISOR_ID).map((agent) => (
+                      <option key={agent.id} value={agent.id}>{agent.label}</option>
+                    ))}
+                  </select>
+                  {defaultAgentChangePending ? <span className="defaultReceiverPending">{defaultAgentChangeConfirming ? "确认中…" : "保存中…"}</span> : null}
+                </label>
+              ) : null}
               <div className="approvalModeControl">
                 <button
                   type="button"
@@ -2248,10 +2537,10 @@ export function App() {
               type="submit"
               theme="primary"
               icon={<SendIcon />}
-              disabled={!hasWorkspace || !hasEnabledAgent || !canSendMessage(content, pendingAttachments.length) || isSending || isSwitchingInteractionMode || uploadingAttachments > 0}
-              title={uploadingAttachments > 0 ? "附件上传中，完成后可发送" : undefined}
+              disabled={!hasWorkspace || !hasEnabledAgent || !canSendMessage(content, pendingAttachments.length) || isSending || isSwitchingInteractionMode || uploadingAttachments > 0 || defaultAgentChangePending}
+              title={defaultAgentChangePending ? (defaultAgentChangeConfirming ? "接收人结果确认中，完成后可发送" : "接收人保存中，完成后可发送") : uploadingAttachments > 0 ? "附件上传中，完成后可发送" : undefined}
             >
-              {isSending ? <span className="sendSpinner" aria-hidden="true" /> : uploadingAttachments > 0 ? "上传中…" : "发送"}
+              {isSending ? <span className="sendSpinner" aria-hidden="true" /> : uploadingAttachments > 0 ? "上传中…" : defaultAgentChangePending ? (defaultAgentChangeConfirming ? "确认中…" : "保存中…") : "发送"}
             </Button>
             </div>
           </div>
@@ -2259,6 +2548,16 @@ export function App() {
         </form>
       </section>
       )}
+      {graphPanelVisible && activeView === "conversation" ? (
+        <GraphPanel
+          workspaceId={state.workspace.id}
+          conversationId={state.conversation.id}
+          liveSignature={graphLiveSignature}
+          overlay={isCompactViewport}
+          onLocateMessage={(messageId) => { void revealMessage(messageId); }}
+          onClose={() => setGraphPanelVisible(false)}
+        />
+      ) : null}
       {previewPath ? (
         <FilePreviewPanel
           path={previewPath}
@@ -2319,6 +2618,7 @@ export function App() {
       ) : null}
       {showSupervisorSettings ? (
         <SupervisorSettingsPanel
+          liveModelState={state.agentModelStates[INTERNAL_SUPERVISOR_ID]}
           workspaceId={state.workspace.id}
           conversationId={state.conversation.id}
           config={supervisorConfig}
@@ -2745,11 +3045,13 @@ function MessageRow({
   agent,
   parentMessage,
   agentsById,
+  highlighted,
 }: {
   message: ChatMessage;
   agent?: AgentState;
   parentMessage?: ChatMessage;
   agentsById: Map<AgentId, AgentState>;
+  highlighted?: boolean;
 }) {
   const author = message.kind === "user" ? "你" : message.kind === "agent" ? agent?.label ?? message.agentId ?? "数字员工" : "系统";
   const isRunning = message.status === "running";
@@ -2795,7 +3097,7 @@ function MessageRow({
   }
 
   return (
-    <article className={`message ${message.kind}`}>
+    <article id={`orbit-msg-${message.id}`} className={`message ${message.kind}${highlighted ? " graphHighlighted" : ""}`}>
       <div className="messageMeta">
         {message.kind === "agent" ? (
           <Avatar
@@ -3527,13 +3829,13 @@ function AgentManagerPanel({
     return availByRuntime.get(runtimeKindToCliKey(runtime));
   }
 
-  // Fallback to "claude-code" to stay consistent with AGENT_RUNTIME_PRIORITY
+  // Fallback to "codex" to stay consistent with AGENT_RUNTIME_PRIORITY
   // and the server-side FALLBACK_RUNTIME in workspace-agent-presets.ts.
   const firstAvailableRuntime = useMemo((): AgentRuntimeKind => {
     for (const rt of RUNTIMES) {
       if (isRuntimeAvailable(rt) === true) return rt;
     }
-    return "claude-code";
+    return "codex";
   }, [availByRuntime]);
 
   useEffect(() => {
@@ -3875,10 +4177,35 @@ function AgentModelField({ config, snapshot, probe, onChange, onRefreshModels, i
     : undefined;
   const probeStatus = probe?.status ?? (snapshot ? (snapshot.choices.length > 0 ? "ready" : "unsupported") : "idle");
   const choices = probeStatus === "ready" ? snapshot?.choices ?? [] : [];
-  const nameOf = (value: string) => choices.find((choice) => choice.value === value)?.name ?? value;
+  // 快照可能过期：已保存的首选不在列表中时补成一项显示，保证设置页的当前值
+  // 以已保存偏好为准，而不是被过期快照的上次会话值误导（settings-save-guard）。
+  const displayChoices = probeStatus === "ready" ? modelChoicesWithSavedPreference(choices, preferred) : choices;
+  const nameOf = (value: string) => displayChoices.find((choice) => choice.value === value)?.name ?? value;
   const preferredMissing = probeStatus === "ready"
     && preferred !== undefined
     && !choices.some((choice) => choice.value === preferred);
+  const reasoning = snapshot?.reasoning;
+  const reasoningPreferred = config.model?.runtimeKind === config.runtime
+    ? config.model?.preferredReasoningValue?.trim() || undefined
+    : undefined;
+  const reasoningDisplayChoices = modelChoicesWithSavedPreference(reasoning?.choices ?? [], reasoningPreferred);
+  const reasoningNameOf = (value: string) => reasoningDisplayChoices.find((choice) => choice.value === value)?.name ?? value;
+  const reasoningMissing = reasoning !== undefined
+    && reasoningPreferred !== undefined
+    && !reasoning.choices.some((choice) => choice.value === reasoningPreferred);
+  const setReasoningPreference = (value: string | undefined) => {
+    if (!preferred && !value) {
+      onChange({ model: undefined });
+      return;
+    }
+    onChange({
+      model: {
+        ...(preferred ? { preferredModelId: preferred } : {}),
+        ...(value ? { preferredReasoningValue: value } : {}),
+        runtimeKind: config.runtime,
+      },
+    });
+  };
   return (
     <div className="modelField fieldFullWidth">
       <div className="modelFieldHeader">
@@ -3893,20 +4220,29 @@ function AgentModelField({ config, snapshot, probe, onChange, onRefreshModels, i
             type="radio"
             name={`model-${config.id}`}
             checked={preferred === undefined}
-            onChange={() => onChange({ model: undefined })}
+            onChange={() => onChange(reasoningPreferred
+              ? { model: { preferredReasoningValue: reasoningPreferred, runtimeKind: config.runtime } }
+              : { model: undefined })}
           />
           <span>跟随运行时默认{probeStatus === "ready" && snapshot?.currentValueSource === "session" && snapshot.currentValue ? `（当前：${nameOf(snapshot.currentValue)}）` : ""}</span>
         </label>
-        {choices.map((choice) => (
+        {displayChoices.map((choice) => (
           <label key={choice.value} className={`modelChoice ${preferred === choice.value ? "modelChoiceActive" : ""}`}>
             <input
               type="radio"
               name={`model-${config.id}`}
               checked={preferred === choice.value}
-              onChange={() => onChange({ model: { preferredModelId: choice.value, runtimeKind: config.runtime } })}
+              onChange={() => onChange({
+                model: {
+                  preferredModelId: choice.value,
+                  ...(reasoningPreferred ? { preferredReasoningValue: reasoningPreferred } : {}),
+                  runtimeKind: config.runtime,
+                },
+              })}
             />
             <span>
               {choice.name}
+              {preferredMissing && choice.value === preferred ? "（已保存的首选）" : ""}
               {probeStatus === "ready" && snapshot?.currentValueSource === "session" && snapshot.currentValue === choice.value && preferred !== choice.value ? "（当前）" : ""}
             </span>
           </label>
@@ -3919,11 +4255,65 @@ function AgentModelField({ config, snapshot, probe, onChange, onRefreshModels, i
       ) : probeStatus === "loading" ? (
         <div className="modelHint">正在获取模型列表...</div>
       ) : preferredMissing ? (
-        <div className="modelHint modelHintWarn">首选模型 {nameOf(preferred)} 当前不可用，下次运行将继续使用当前模型并在对话中提示。</div>
+        <div className="modelHint modelHintWarn">首选模型 {nameOf(preferred)} 不在当前列表中（列表可能已过期），上方仍按已保存的首选显示；点击「刷新模型列表」可更新列表。若刷新后仍不可用，下次运行将继续使用当前模型并在对话中提示。</div>
       ) : null}
-      <div className="modelHint">模型选择在该数字员工下次运行时生效。</div>
+      {reasoning && reasoning.choices.length > 0 ? (
+        <>
+          <div className="modelFieldHeader">
+            <span className="pillLabel">思考强度 <span className="fieldHint" title="该运行时提供的思考强度选项，档位与名称由运行时决定。每次运行开始时在模型之后应用；所选档位若对当前模型不可用，会明确提示且不自动替换。">?</span></span>
+          </div>
+          <div className="modelChoiceList">
+            <label className={`modelChoice ${reasoningPreferred === undefined ? "modelChoiceActive" : ""}`}>
+              <input
+                type="radio"
+                name={`reasoning-${config.id}`}
+                checked={reasoningPreferred === undefined}
+                onChange={() => setReasoningPreference(undefined)}
+              />
+              <span>跟随运行时默认{reasoning.currentValueSource === "session" && reasoning.currentValue ? `（当前：${reasoningNameOf(reasoning.currentValue)}）` : ""}</span>
+            </label>
+            {reasoningDisplayChoices.map((choice) => (
+              <label key={choice.value} className={`modelChoice ${reasoningPreferred === choice.value ? "modelChoiceActive" : ""}`}>
+                <input
+                  type="radio"
+                  name={`reasoning-${config.id}`}
+                  checked={reasoningPreferred === choice.value}
+                  onChange={() => setReasoningPreference(choice.value)}
+                />
+                <span>
+                  {choice.name}
+                  {reasoningMissing && choice.value === reasoningPreferred ? "（已保存的首选）" : ""}
+                  {reasoning.currentValueSource === "session" && reasoning.currentValue === choice.value && reasoningPreferred !== choice.value ? "（当前）" : ""}
+                </span>
+              </label>
+            ))}
+          </div>
+          {reasoningMissing ? (
+            <div className="modelHint modelHintWarn">首选思考强度 {reasoningNameOf(reasoningPreferred ?? "")} 不在当前列表中（列表可能已过期），仍按已保存的首选显示；刷新模型列表可更新列表，不会自动替换。</div>
+          ) : null}
+        </>
+      ) : null}
+      {snapshot?.modelApplyPath === "session_model" ? (
+        <div className="modelHint">该运行时的模型是带思考强度的变体，选择即同时确定模型与思考强度。</div>
+      ) : null}
+      <div className="modelHint">模型与思考强度选择在该数字员工下次运行时生效。</div>
     </div>
   );
+}
+
+/**
+ * 选项列表补齐已保存的首选（settings-save-guard）：快照可能过期（如新模型
+ * 通道接通前留下的列表），此时已保存的首选不在可选列表里，单选组会出现
+ * 「没有任何一项被选中、过期值反而被标注为当前」的误导状态。把首选补成
+ * 一项渲染出来，保证设置页显示的当前值始终以已保存的偏好为准；快照只
+ * 提供可选项列表，不决定当前值。
+ */
+export function modelChoicesWithSavedPreference(
+  choices: AgentModelChoice[],
+  preferred: string | undefined,
+): AgentModelChoice[] {
+  if (!preferred || choices.some((choice) => choice.value === preferred)) return choices;
+  return [...choices, { value: preferred, name: preferred }];
 }
 
 export function mergeProbedConfigs(
@@ -3982,6 +4372,7 @@ function PlainText({ content }: { content: string }) {
  * - 偏好按 runtime 归属门控：换运行时后旧偏好既不生效也不展示。
  */
 function SupervisorSettingsPanel({
+  liveModelState,
   workspaceId,
   conversationId,
   config,
@@ -3989,6 +4380,7 @@ function SupervisorSettingsPanel({
   onClose,
   onSave,
 }: {
+  liveModelState?: AgentModelStateSnapshot;
   workspaceId: string;
   conversationId: string;
   config: SupervisorConfig;
@@ -4028,6 +4420,16 @@ function SupervisorSettingsPanel({
     }
   }
 
+  // 服务端定点非强制探测走 stale-while-revalidate：打开时先给已存快照，
+  // 后台刷新完成的新快照经 SSE 到达后实时采纳，免得面板停在打开时的旧清单。
+  // 只采纳同运行时的快照；updatedAt 相同视为同一份，不重复替换。
+  useEffect(() => {
+    if (!liveModelState || liveModelState.runtimeKind !== runtime) return;
+    setSnapshot((current) => (
+      current && current.updatedAt === liveModelState.updatedAt ? current : liveModelState
+    ));
+  }, [liveModelState, runtime]);
+
   // 首次打开按需探测当前监工的运行时；切换运行时后再探测一次新的。
   useEffect(() => {
     if (probedRuntimeRef.current === runtime) return;
@@ -4062,6 +4464,23 @@ function SupervisorSettingsPanel({
   const nameOf = (value: string) => choices.find((choice) => choice.value === value)?.name ?? value;
   // 偏好按 runtime 归属：与当前 runtime 不一致即不应用、不展示。
   const preferred = model?.runtimeKind === runtime ? model.preferredModelId?.trim() || undefined : undefined;
+  const reasoningSnapshot = snapshot?.reasoning;
+  const reasoningPreferred = model?.runtimeKind === runtime ? model.preferredReasoningValue?.trim() || undefined : undefined;
+  const reasoningNameOf = (value: string) => reasoningSnapshot?.choices.find((choice) => choice.value === value)?.name ?? value;
+  const reasoningMissing = reasoningSnapshot !== undefined
+    && reasoningPreferred !== undefined
+    && !reasoningSnapshot.choices.some((choice) => choice.value === reasoningPreferred);
+  const setReasoningPreference = (value: string | undefined) => {
+    if (!preferred && !value) {
+      setModel(undefined);
+      return;
+    }
+    setModel({
+      ...(preferred ? { preferredModelId: preferred } : {}),
+      ...(value ? { preferredReasoningValue: value } : {}),
+      runtimeKind: runtime,
+    });
+  };
   const unavailable = new Set(
     availability.filter((item) => !item.available).map((item) => runtimeKindToCliKey(item.runtime)),
   );
@@ -4114,7 +4533,9 @@ function SupervisorSettingsPanel({
                   type="radio"
                   name="supervisor-model"
                   checked={preferred === undefined}
-                  onChange={() => setModel(undefined)}
+                  onChange={() => setModel(reasoningPreferred
+                    ? { preferredReasoningValue: reasoningPreferred, runtimeKind: runtime }
+                    : undefined)}
                 />
                 <span>
                   跟随运行时默认
@@ -4129,7 +4550,11 @@ function SupervisorSettingsPanel({
                     type="radio"
                     name="supervisor-model"
                     checked={preferred === choice.value}
-                    onChange={() => setModel({ preferredModelId: choice.value, runtimeKind: runtime })}
+                    onChange={() => setModel({
+                    preferredModelId: choice.value,
+                    ...(reasoningPreferred ? { preferredReasoningValue: reasoningPreferred } : {}),
+                    runtimeKind: runtime,
+                  })}
                   />
                   <span>
                     {choice.name}
@@ -4146,7 +4571,42 @@ function SupervisorSettingsPanel({
             ) : probeStatus === "loading" ? (
               <div className="modelHint">正在获取模型列表...</div>
             ) : null}
-            <div className="modelHint">模型选择在监工下次运行时生效。</div>
+            {reasoningSnapshot && reasoningSnapshot.choices.length > 0 ? (
+              <>
+                <div className="modelFieldHeader">
+                  <span className="pillLabel">思考强度 <span className="fieldHint" title="该运行时提供的思考强度选项，档位与名称由运行时决定。每次运行开始时在模型之后应用；所选档位若对当前模型不可用，会明确提示且不自动替换。">?</span></span>
+                </div>
+                <div className="modelChoiceList">
+                  <label className={`modelChoice ${reasoningPreferred === undefined ? "modelChoiceActive" : ""}`}>
+                    <input
+                      type="radio"
+                      name="supervisor-reasoning"
+                      checked={reasoningPreferred === undefined}
+                      onChange={() => setReasoningPreference(undefined)}
+                    />
+                    <span>跟随运行时默认{reasoningSnapshot.currentValueSource === "session" && reasoningSnapshot.currentValue ? `（当前：${reasoningNameOf(reasoningSnapshot.currentValue)}）` : ""}</span>
+                  </label>
+                  {reasoningSnapshot.choices.map((choice) => (
+                    <label key={choice.value} className={`modelChoice ${reasoningPreferred === choice.value ? "modelChoiceActive" : ""}`}>
+                      <input
+                        type="radio"
+                        name="supervisor-reasoning"
+                        checked={reasoningPreferred === choice.value}
+                        onChange={() => setReasoningPreference(choice.value)}
+                      />
+                      <span>
+                        {choice.name}
+                        {reasoningSnapshot.currentValueSource === "session" && reasoningSnapshot.currentValue === choice.value && reasoningPreferred !== choice.value ? "（当前）" : ""}
+                      </span>
+                    </label>
+                  ))}
+                </div>
+                {reasoningMissing ? (
+                  <div className="modelHint modelHintWarn">首选思考强度 {reasoningNameOf(reasoningPreferred ?? "")} 当前不可用，下次运行将继续使用当前设置并在对话中提示，不会自动替换。</div>
+                ) : null}
+              </>
+            ) : null}
+            <div className="modelHint">模型与思考强度选择在监工下次运行时生效。</div>
           </div>
           {error ? <div className="modelHint modelHintWarn">{error}</div> : null}
           <div className="modalFooter">
@@ -4376,6 +4836,12 @@ function RuntimeBadge({ runtime }: { runtime: AgentState["runtime"] }) {
 }
 
 function runtimeLabel(runtime: AgentState["runtime"]): string {
+  if (runtime === "workbuddy") {
+    return "WorkBuddy";
+  }
+  if (runtime === "dsh") {
+    return "DeepSeek Harness";
+  }
   if (runtime === "codebuddy") {
     return "CodeBuddy";
   }
