@@ -14,7 +14,8 @@ import {
   type NodeProps,
 } from "@xyflow/react";
 import * as dagre from "@dagrejs/dagre";
-import "@xyflow/react/dist/style.css";
+// 注意：@xyflow/react 的样式表在入口 main.tsx 统一导入——组件内导入 .css
+// 会让以 node:test 直接加载 App.tsx 的前端测试报 ERR_UNKNOWN_FILE_EXTENSION。
 
 import type {
   ConversationGraph,
