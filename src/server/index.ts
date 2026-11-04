@@ -11,6 +11,7 @@ import { defaultAcpRunnerRegistry } from "../core/acp-runner-registry.ts";
 import { AGENT_TEAM_TEMPLATES, AgentConfigStore, validateAgentConfigs } from "../core/agent-config-store.ts";
 import { AgentModelStateStore, supervisorStorageKey } from "../core/agent-model-state-store.ts";
 import { findStaleSnapshotPreferenceOverwrite } from "../core/agent-model-guard.ts";
+import { buildConversationGraph } from "../core/conversation-graph.ts";
 import { probeAllRuntimes, runtimeKindToCliKey, type RuntimeProbeResult } from "../core/runtime-probe.ts";
 import type { AgentConfig } from "../core/agent-config-store.ts";
 import { WorkspaceConfigStore } from "../core/workspace-config-store.ts";
@@ -26,7 +27,7 @@ import { initialAgentConfigsForWorkspacePreset } from "../core/workspace-agent-p
 import { getWorkspacePresets } from "../core/workspace-presets.ts";
 import { migrateChannelLayer } from "../core/migrate-channel-layer.ts";
 import { cleanupHistory } from "../core/history-retention.ts";
-import type { AgentCommandsSnapshot, AgentConfigWithModelState, AgentModelProbeResponse, AgentModelProbeState, AgentModelStateSnapshot, ApprovalMode, Conversation, ConversationInfo, ElicitationResponse, InteractionMode, MessagePage, PermissionDecision, RunningSummary, SupervisorConfig, WorkspaceInfo, AgentId } from "../shared/types.ts";
+import type { AgentCommandsSnapshot, AgentConfigWithModelState, AgentModelProbeResponse, AgentModelProbeState, AgentModelStateSnapshot, ApprovalMode, Conversation, ConversationInfo, ElicitationResponse, InteractionMode, MessagePage, PermissionDecision, RunningSummary, SupervisorConfig, WorkspaceInfo, AgentId, ChatMessage } from "../shared/types.ts";
 import { isAgentRuntimeKind, isInteractionMode } from "../shared/types.ts";
 import { ATTACHMENT_LIMITS } from "../shared/types.ts";
 import { AttachmentStore } from "../core/attachment-store.ts";
@@ -907,6 +908,53 @@ const server = http.createServer(async (req, res) => {
         workspaceStore,
         conversationStore: conversationStoreFor(workspaceId),
         agentConfigStore: configStore,
+      }));
+      return;
+    }
+
+    // 指令链导图（工作树）：把会话落盘消息整形成父子链森林 DTO。
+    // 历史以落盘为准：historySince(0) 读全部 shard，再以内存现势覆盖同 id；
+    // 在跑状态与当前 plan 步经 RunManager 现势投影叠加（与 /api/state 同口径）。
+    if (req.method === "GET" && url.pathname.startsWith("/api/conversations/") && url.pathname.endsWith("/graph")) {
+      const parts = url.pathname.split("/");
+      const convId = parts[3];
+      if (!convId) { sendJson(res, 400, { ok: false, message: "Missing conversation id." }); return; }
+      const target = resolveTarget(url);
+      if (!target || target.conversationId !== convId) {
+        sendJson(res, 409, { ok: false, message: "workspaceId and conversationId are required." });
+        return;
+      }
+      const ctx = contextForTarget(target);
+      if (!ctx) {
+        sendJson(res, 200, {
+          workspaceId: target.workspaceId,
+          conversationId: convId,
+          generatedAt: new Date().toISOString(),
+          roots: [],
+          nodes: [],
+          edges: [],
+        });
+        return;
+      }
+      const byId = new Map<string, ChatMessage>();
+      for (const message of ctx.messages.historySince(0)) byId.set(message.id, message);
+      for (const message of ctx.messages.list()) byId.set(message.id, message);
+      const merged = [...byId.values()].sort(
+        (a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id),
+      );
+      const projected = ctx.runManager.projectLiveProcessState(merged);
+      const agentLabels = new Map<AgentId, string>();
+      const agentRuntimes = new Map<AgentId, string>();
+      for (const agentState of ctx.agents.states()) {
+        agentLabels.set(agentState.id, agentState.label);
+        agentRuntimes.set(agentState.id, agentState.runtime);
+      }
+      sendJson(res, 200, buildConversationGraph({
+        workspaceId: target.workspaceId,
+        conversationId: convId,
+        messages: projected,
+        agentLabels,
+        agentRuntimes,
       }));
       return;
     }

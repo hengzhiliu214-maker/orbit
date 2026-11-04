@@ -15,6 +15,7 @@ import { createDefaultAgentChangeTracker, type DefaultAgentChangeRequest } from 
 import { createConversationForUpload } from "./attachment-upload-conversation.ts";
 import { appendTransientProcessActivity, collapseToolExecutions, type ProcessToolActivity, type ProcessToolExecution } from "../shared/process-activity.ts";
 import { WorkAnalysisPanel } from "./WorkAnalysisPanel.tsx";
+import { GraphPanel } from "./GraphPanel.tsx";
 import { FilePreviewPanel } from "./FilePreviewPanel.tsx";
 import * as TDesign from "tdesign-react";
 import {
@@ -110,6 +111,20 @@ function loadActiveView(): ActiveView {
   }
 }
 
+const GRAPH_PANEL_STORAGE_KEY = "orbit.graphPanelVisible";
+
+export function resolveGraphPanelVisible(stored: string | null): boolean {
+  return stored !== "hidden";
+}
+
+function loadGraphPanelVisible(): boolean {
+  try {
+    return resolveGraphPanelVisible(window.localStorage.getItem(GRAPH_PANEL_STORAGE_KEY));
+  } catch {
+    return true;
+  }
+}
+
 export function resolveApprovalMode(storedMode: string | null): ApprovalMode {
   return storedMode === "ask" ? "ask" : "full-access";
 }
@@ -135,6 +150,9 @@ export function isImeComposition(event: { nativeEvent: { isComposing?: boolean }
 export function App() {
   const [state, setState] = useState<AppState>(initialState);
   const [activeView, setActiveView] = useState<ActiveView>(loadActiveView);
+  const [graphPanelVisible, setGraphPanelVisible] = useState<boolean>(loadGraphPanelVisible);
+  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
+  const highlightTimerRef = useRef<number | null>(null);
   const [content, setContent] = useState("");
   const [approvalMode, setApprovalMode] = useState<ApprovalMode>(loadApprovalMode);
   const [showApprovalModeMenu, setShowApprovalModeMenu] = useState(false);
@@ -229,6 +247,14 @@ export function App() {
       // The view still works when storage is unavailable; only reload persistence is lost.
     }
   }, [activeView]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(GRAPH_PANEL_STORAGE_KEY, graphPanelVisible ? "visible" : "hidden");
+    } catch {
+      // Same trade-off as the view persistence above.
+    }
+  }, [graphPanelVisible]);
 
   useEffect(() => {
     try {
@@ -484,6 +510,15 @@ export function App() {
   }, [state.agents, supervisorConfig.runtime]);
   const messagesById = useMemo(() => new Map(state.messages.map((message) => [message.id, message])), [state.messages]);
   const visibleMessages = useMemo(() => state.messages.filter((message) => !message.discarded), [state.messages]);
+  // 指令链面板的实时签名：消息集合或任一消息的运行状态变化即触发面板防抖重拉。
+  const graphLiveSignature = useMemo(() => {
+    let hash = state.messages.length;
+    for (const message of state.messages) {
+      const token = `${message.id}:${message.runStatus ?? ""}:${message.status ?? ""}:${message.completedAt ?? ""};`;
+      for (let i = 0; i < token.length; i++) hash = (hash * 31 + token.charCodeAt(i)) | 0;
+    }
+    return `${state.conversation.id}:${hash}`;
+  }, [state.messages, state.conversation.id]);
   const agentIds = useMemo(() => state.agents.map((agent) => agent.id), [state.agents]);
   const hasEnabledAgent = agentIds.length > 0;
   const interactionMode: InteractionMode = state.conversation.interactionMode ?? "direct";
@@ -1437,6 +1472,37 @@ export function App() {
     }
   }
 
+  // 指令链节点点击定位：目标消息可能尚未加载（在更早的分页里），逐页向前
+  // 加载直到 DOM 出现该消息锚点；游标在本函数内推进，避免依赖渲染期状态。
+  async function revealMessage(messageId: string) {
+    const requestContext = {
+      workspaceId: state.workspace.id,
+      conversationId: state.conversation.id,
+    };
+    let cursor = state.messageHistory.olderCursor;
+    for (let attempt = 0; attempt < 24; attempt++) {
+      const element = document.getElementById(`orbit-msg-${messageId}`);
+      if (element) {
+        element.scrollIntoView({ block: "center", behavior: "smooth" });
+        setHighlightedMessageId(messageId);
+        if (highlightTimerRef.current !== null) window.clearTimeout(highlightTimerRef.current);
+        highlightTimerRef.current = window.setTimeout(() => setHighlightedMessageId(null), 2400);
+        return;
+      }
+      if (!cursor) return;
+      try {
+        const response = await fetch(withPageContext(`/api/messages?before=${encodeURIComponent(cursor)}&limit=50`, requestContext));
+        if (!response.ok) return;
+        const page = (await response.json()) as MessagePage;
+        cursor = page.olderCursor;
+        setState((current) => mergeOlderMessagesPage(current, requestContext, page));
+      } catch {
+        return;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 80));
+    }
+  }
+
   function chooseAgent(agentId: AgentId) {
     const agentName = agentsById.get(agentId)?.label ?? agentId;
     setSelectedAgent(agentId);
@@ -1820,10 +1886,11 @@ export function App() {
   // 预览面板作为第三栏（previewOpen 类，宽度由 styles.css 定义）；窄视口
   // （≤920px）下不挂类，面板转为浮层，不占用网格列。
   const previewColumnActive = previewPath !== null && !isCompactViewport;
+  const graphColumnActive = graphPanelVisible && activeView === "conversation" && !isCompactViewport;
 
   return (
     <main
-      className={`shell ${sidebarCollapsed ? "sidebarCollapsed" : ""}${previewColumnActive ? " previewOpen" : ""}`}
+      className={`shell ${sidebarCollapsed ? "sidebarCollapsed" : ""}${previewColumnActive ? " previewOpen" : ""}${graphColumnActive ? " graphOpen" : ""}`}
       style={{
         gridTemplateColumns: sidebarCollapsed ? "0 minmax(0, 1fr)" : `${sidebarWidth}px minmax(0, 1fr)`,
         "--sidebar-resize-left": `${sidebarWidth}px`,
@@ -2090,6 +2157,15 @@ export function App() {
             {state.workspace.path ? <p className="workspacePath" title={state.workspace.path}>{state.workspace.path}</p> : null}
           </div>
           <div className="conversationHeaderRight">
+            <button
+              type="button"
+              className={`graphToggleBtn ${graphPanelVisible ? "active" : ""}`}
+              onClick={() => setGraphPanelVisible((visible) => !visible)}
+              title={graphPanelVisible ? "隐藏指令链面板" : "显示指令链面板"}
+              aria-pressed={graphPanelVisible}
+            >
+              指令链
+            </button>
             <Avatar.Group size="28px" max={4}>
               {state.agents.map((agent) => <Avatar key={agent.id} style={{ backgroundColor: agentColor(agent.id) }}>{agent.label.slice(0, 1)}</Avatar>)}
             </Avatar.Group>
@@ -2146,6 +2222,7 @@ export function App() {
                 agent={message.agentId ? agentsById.get(message.agentId) : undefined}
                 parentMessage={message.parentMessageId ? messagesById.get(message.parentMessageId) : undefined}
                 agentsById={agentsById}
+                highlighted={highlightedMessageId === message.id}
               />
             ))
           )}
@@ -2471,6 +2548,16 @@ export function App() {
         </form>
       </section>
       )}
+      {graphPanelVisible && activeView === "conversation" ? (
+        <GraphPanel
+          workspaceId={state.workspace.id}
+          conversationId={state.conversation.id}
+          liveSignature={graphLiveSignature}
+          overlay={isCompactViewport}
+          onLocateMessage={(messageId) => { void revealMessage(messageId); }}
+          onClose={() => setGraphPanelVisible(false)}
+        />
+      ) : null}
       {previewPath ? (
         <FilePreviewPanel
           path={previewPath}
@@ -2958,11 +3045,13 @@ function MessageRow({
   agent,
   parentMessage,
   agentsById,
+  highlighted,
 }: {
   message: ChatMessage;
   agent?: AgentState;
   parentMessage?: ChatMessage;
   agentsById: Map<AgentId, AgentState>;
+  highlighted?: boolean;
 }) {
   const author = message.kind === "user" ? "你" : message.kind === "agent" ? agent?.label ?? message.agentId ?? "数字员工" : "系统";
   const isRunning = message.status === "running";
@@ -3008,7 +3097,7 @@ function MessageRow({
   }
 
   return (
-    <article className={`message ${message.kind}`}>
+    <article id={`orbit-msg-${message.id}`} className={`message ${message.kind}${highlighted ? " graphHighlighted" : ""}`}>
       <div className="messageMeta">
         {message.kind === "agent" ? (
           <Avatar

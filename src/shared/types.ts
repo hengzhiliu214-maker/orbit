@@ -486,6 +486,67 @@ export type WorkAnalysis = {
   tasks: WorkTask[];
 };
 
+export type ConversationGraphNodeStatus = "queued" | "running" | "cancelling" | "completed" | "failed" | "cancelled";
+
+/**
+ * 指令链导图（工作树）的一个节点：根用户消息（kind "root"）或一次数字员工
+ * 执行（kind "run"，对应一条带 runId 的 agent 消息）。origin 由落盘父链推导：
+ * 直接父消息为 system（监工指令消息）或父节点为监工本人时记 supervisor。
+ * 注意：落盘数据没有逐 run 的模型名，节点只带员工显示名与 runtime。
+ */
+export type ConversationGraphNode = {
+  id: string;
+  kind: "root" | "run";
+  messageId: string;
+  runId?: string;
+  agentId?: AgentId;
+  agentLabel?: string;
+  runtime?: string;
+  origin: "user" | "agent" | "supervisor";
+  parentNodeId?: string;
+  rootId: string;
+  routeDepth?: number;
+  routeState?: MessageRouteState;
+  /** 供前端淡化：路由被 blocked，或从未派出任何执行的根消息（ignored）。 */
+  dimmed: boolean;
+  status?: ConversationGraphNodeStatus;
+  title: string;
+  createdAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  /** 正在执行的节点当前 plan 步（仅 items 格式 plan 且有 in_progress 条目时）。 */
+  planCurrentStep?: string;
+  childCount: number;
+};
+
+export type ConversationGraphEdge = {
+  id: string;
+  source: string;
+  target: string;
+  /** 源节点消息的路由状态：描述这条边所代表的那次派发如何被处理。 */
+  routeState?: MessageRouteState;
+  dimmed: boolean;
+};
+
+export type ConversationGraphRoot = {
+  id: string;
+  title: string;
+  createdAt: string;
+  /** 无任何执行后代的根为 idle；其余按后代运行聚合（口径见 conversation-graph）。 */
+  status: ConversationGraphNodeStatus | "idle";
+  nodeCount: number;
+  latestActivityAt: string;
+};
+
+export type ConversationGraph = {
+  workspaceId: string;
+  conversationId: string;
+  generatedAt: string;
+  roots: ConversationGraphRoot[];
+  nodes: ConversationGraphNode[];
+  edges: ConversationGraphEdge[];
+};
+
 export type MessageHistoryState = {
   hasOlderMessages: boolean;
   olderCursor: string | null;
