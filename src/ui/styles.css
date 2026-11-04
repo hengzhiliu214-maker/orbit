@@ -2056,6 +2056,31 @@ button:active:not(:disabled) {
   padding: 0 8px 7px;
 }
 
+.defaultReceiverControl {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 8px;
+  font-size: 12px;
+  white-space: nowrap;
+  opacity: 0.85;
+}
+
+.defaultReceiverControl select {
+  min-height: 30px;
+  max-width: 180px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+
+.defaultReceiverPending {
+  font-size: 12px;
+  opacity: 0.75;
+}
+
 .approvalModeControl,
 .interactionModeControl {
   position: relative;
@@ -6538,6 +6563,24 @@ button:active:not(:disabled) {
     grid-template-columns: 0 minmax(0, 1fr) var(--preview-width, clamp(300px, 34vw, 480px)) !important;
   }
 
+  /* 指令链面板（工作树）：与预览面板同为附加栏，DOM 顺序在预览之前，
+     故同开时占第三栏、预览顺延第四栏。窄视口下 App 不挂该类，面板转浮层。 */
+  .shell.graphOpen {
+    grid-template-columns: 288px minmax(0, 1fr) var(--graph-width, clamp(340px, 30vw, 460px)) !important;
+  }
+
+  .shell.sidebarCollapsed.graphOpen {
+    grid-template-columns: 0 minmax(0, 1fr) var(--graph-width, clamp(340px, 30vw, 460px)) !important;
+  }
+
+  .shell.previewOpen.graphOpen {
+    grid-template-columns: 288px minmax(0, 1fr) var(--graph-width, clamp(340px, 30vw, 460px)) var(--preview-width, clamp(300px, 34vw, 480px)) !important;
+  }
+
+  .shell.sidebarCollapsed.previewOpen.graphOpen {
+    grid-template-columns: 0 minmax(0, 1fr) var(--graph-width, clamp(340px, 30vw, 460px)) var(--preview-width, clamp(300px, 34vw, 480px)) !important;
+  }
+
   .sidebar {
     padding: 0;
     gap: 0;
@@ -7046,4 +7089,610 @@ button:active:not(:disabled) {
   max-height: none;
   overflow-x: hidden;
   overflow-y: auto;
+}
+
+/* ── 指令链工作树面板 ──────────────────────────────────── */
+
+.graphToggleBtn {
+  border: 1px solid var(--border);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  border-radius: 999px;
+  padding: 5px 12px;
+  font-size: 12.5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.graphToggleBtn:hover {
+  background: var(--bg-hover);
+}
+
+.graphToggleBtn.active {
+  background: var(--accent-subtle);
+  border-color: var(--accent-border);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.graphPanel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  border-left: 1px solid var(--border);
+  background: var(--bg-surface);
+  overflow: hidden;
+}
+
+.graphPanel.overlay {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(420px, 94vw);
+  z-index: 80;
+  box-shadow: -12px 0 32px rgba(15, 23, 42, 0.18);
+}
+
+.graphPanelHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px 10px;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.graphPanelTitle {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.graphPanelTitle strong {
+  font-size: 15px;
+  color: var(--text-primary);
+}
+
+.graphPanelTitle span {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.graphPanelClose {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+
+.graphPanelClose:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.graphRootBar {
+  display: flex;
+  gap: 6px;
+  padding: 10px 12px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--border-light);
+  scrollbar-width: thin;
+}
+
+.graphRootChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 180px;
+  border: 1px solid var(--border);
+  background: var(--bg-muted);
+  color: var(--text-secondary);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  flex: none;
+}
+
+.graphRootChip.active {
+  background: var(--accent-subtle);
+  border-color: var(--accent-border);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.graphRootChipTitle {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.graphCanvasWrap {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+.graphCanvasWrap .react-flow {
+  background: var(--bg-base);
+}
+
+.graphEmpty {
+  padding: 28px 20px;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.graphStatusDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  flex: none;
+}
+
+.graphStatusDot.running {
+  background: var(--accent);
+  animation: graphPulse 1.4s ease-in-out infinite;
+}
+
+.graphStatusDot.queued {
+  background: var(--text-muted);
+}
+
+.graphStatusDot.cancelling {
+  background: var(--warning);
+}
+
+.graphStatusDot.completed {
+  background: var(--success);
+}
+
+.graphStatusDot.failed {
+  background: var(--error);
+}
+
+.graphStatusDot.cancelled {
+  background: var(--text-muted);
+  opacity: 0.55;
+}
+
+.graphStatusDot.root,
+.graphStatusDot.idle {
+  background: var(--border);
+  border: 1px solid var(--text-muted);
+}
+
+@keyframes graphPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.graphNodeCard {
+  width: 216px;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--text-muted);
+  border-radius: 10px;
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-xs, 0 1px 2px rgba(15, 23, 42, 0.06));
+  padding: 8px 10px;
+  font-family: var(--font-body);
+  cursor: pointer;
+}
+
+.graphNodeCard.root {
+  border-left-color: var(--accent);
+  background: var(--accent-subtle);
+}
+
+.graphNodeCard.status-running {
+  border-left-color: var(--accent);
+}
+
+.graphNodeCard.status-completed {
+  border-left-color: var(--success);
+}
+
+.graphNodeCard.status-failed {
+  border-left-color: var(--error);
+}
+
+.graphNodeCard.status-cancelling {
+  border-left-color: var(--warning);
+}
+
+.graphNodeCard.status-cancelled,
+.graphNodeCard.status-queued {
+  border-left-color: var(--text-muted);
+}
+
+.graphNodeCard.dimmed {
+  opacity: 0.55;
+}
+
+.graphNodeHead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.graphNodeAuthor {
+  font-size: 12.5px;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.graphRuntimeBadge,
+.graphOriginBadge {
+  font-size: 10.5px;
+  line-height: 1.5;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--bg-muted);
+  color: var(--text-muted);
+  white-space: nowrap;
+  flex: none;
+}
+
+.graphOriginBadge {
+  background: #fdf3e7;
+  color: var(--warning);
+}
+
+.graphCollapseBtn {
+  margin-left: auto;
+  border: 1px solid var(--border);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1.4;
+  padding: 0 6px;
+  cursor: pointer;
+  flex: none;
+}
+
+.graphCollapseBtn:hover {
+  background: var(--bg-hover);
+}
+
+.graphNodeTitle {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.graphNodeStep {
+  margin-top: 3px;
+  font-size: 11.5px;
+  color: var(--accent);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.graphNodeMeta {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.graphHandle {
+  width: 6px;
+  height: 6px;
+  background: var(--text-muted);
+  border: none;
+}
+
+.graphPanel .react-flow__edge.graphEdgeDimmed path {
+  opacity: 0.35;
+}
+
+.message.graphHighlighted {
+  animation: graphHighlightFlash 2.4s ease-out;
+  border-radius: 12px;
+}
+
+@keyframes graphHighlightFlash {
+  0%, 55% {
+    background: var(--accent-subtle);
+    box-shadow: 0 0 0 2px var(--accent-border);
+  }
+  100% {
+    background: transparent;
+    box-shadow: none;
+  }
+}
+
+/* ===== 工作树二期：节点类型/阻碍徽标/重试/问题台 ===== */
+.graphTabs {
+  display: flex;
+  gap: 6px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.graphTabBtn {
+  border: 1px solid var(--border);
+  background: var(--bg-muted);
+  color: var(--text-secondary);
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 12.5px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.graphTabBtn.active {
+  background: var(--accent-subtle);
+  border-color: var(--accent-border);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.graphTabCount {
+  background: var(--error);
+  color: #fff;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1.5;
+  padding: 0 6px;
+}
+
+.graphTypeBadge {
+  font-size: 10.5px;
+  line-height: 1.5;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--bg-muted);
+  color: var(--text-muted);
+  white-space: nowrap;
+  flex: none;
+}
+
+.graphTypeBadge.type-instruction {
+  background: var(--accent-subtle);
+  color: var(--accent);
+}
+
+.graphTypeBadge.type-conclusion {
+  background: #e8f7ee;
+  color: var(--success);
+}
+
+.graphObstacleBadge {
+  font-size: 10.5px;
+  line-height: 1.5;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: #fdecec;
+  color: var(--error);
+  white-space: nowrap;
+  flex: none;
+}
+
+.graphRetryBtn {
+  margin-top: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg-muted);
+  color: var(--text-secondary);
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1.5;
+  padding: 1px 7px;
+  cursor: pointer;
+}
+
+.graphRetryBtn:hover {
+  background: var(--bg-hover);
+}
+
+.graphNodeCard.conclusion {
+  border-left-color: var(--success);
+}
+
+.problemBoard {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.problemBoardHead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.problemBoardNote {
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-muted);
+}
+
+.problemToggle {
+  font-size: 12px;
+  color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  cursor: pointer;
+}
+
+.problemIncomplete {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--warning);
+  background: #fdf3e7;
+  border: 1px solid var(--border-light);
+  border-radius: 8px;
+  padding: 6px 10px;
+}
+
+.problemCluster {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-surface);
+  overflow: hidden;
+}
+
+.problemClusterHead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  border: none;
+  background: var(--bg-muted);
+  padding: 7px 10px;
+  cursor: pointer;
+  text-align: left;
+  font-family: var(--font-body);
+}
+
+.problemClusterTitle {
+  font-size: 12px;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.problemClusterCount {
+  font-size: 11px;
+  color: var(--error);
+  flex: none;
+}
+
+.problemCode {
+  font-size: 11px;
+  font-family: monospace;
+  background: #fdecec;
+  color: var(--error);
+  border-radius: 6px;
+  padding: 0 5px;
+  flex: none;
+}
+
+.problemKindBadge {
+  font-size: 10.5px;
+  line-height: 1.5;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: #fdecec;
+  color: var(--error);
+  white-space: nowrap;
+  flex: none;
+}
+
+.problemKindBadge.kind-run-cancelled,
+.problemKindBadge.kind-route-blocked {
+  background: #fdf3e7;
+  color: var(--warning);
+}
+
+.problemItem {
+  padding: 8px 10px;
+  border-top: 1px solid var(--border-light);
+}
+
+.problemItemHead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.problemAgent {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.problemTime {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.problemSource {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.problemText {
+  margin-top: 5px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.problemText.clamped {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.problemExpandBtn,
+.problemLocateBtn {
+  border: 1px solid var(--border);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1.5;
+  padding: 1px 7px;
+  cursor: pointer;
+  margin-top: 4px;
+}
+
+.problemExpandBtn:hover,
+.problemLocateBtn:hover {
+  background: var(--bg-hover);
+}
+
+.problemItemFoot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.problemNodeId {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  font-family: monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
