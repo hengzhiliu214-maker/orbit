@@ -470,7 +470,9 @@ export function runAcp(
   };
 }
 
-const MODEL_PROBE_TIMEOUT_MS = 15_000;
+// 30s：Codex 冷启动实测（2026-11-04）initialize 约 0.2s、session/new 约 7.5s，
+// 机器唤醒后多进程争抢时曾连续 5 次超过 15s 导致模型获取超时；留足余量避免误杀慢启动。
+const MODEL_PROBE_TIMEOUT_MS = 30_000;
 
 /**
  * 在不发送 prompt 的前提下读取 runtime 的模型配置。设置面板首次打开时使用，
