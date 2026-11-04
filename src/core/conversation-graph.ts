@@ -4,10 +4,12 @@ import type {
   ConversationGraph,
   ConversationGraphNode,
   ConversationGraphNodeStatus,
+  ConversationGraphNodeType,
   ConversationGraphRoot,
 } from "../shared/types.ts";
 import { INTERNAL_SUPERVISOR_ID } from "./agent-profiles.ts";
 import { assignmentPattern } from "./mention-router.ts";
+import { buildProblemBoard, emptyProblems } from "./conversation-problems.ts";
 
 export type BuildConversationGraphOptions = {
   workspaceId: string;
@@ -16,6 +18,8 @@ export type BuildConversationGraphOptions = {
   agentLabels: ReadonlyMap<AgentId, string>;
   agentRuntimes?: ReadonlyMap<AgentId, string>;
   now?: Date;
+  /** 问题台派生开关（默认开）；关闭时 problems.enabled=false 且节点 obstacleCount 恒 0，原图不受影响。 */
+  includeProblems?: boolean;
 };
 
 /**
@@ -57,6 +61,8 @@ export function buildConversationGraph(options: BuildConversationGraphOptions): 
     if (parentNodeId) childCountById.set(parentNodeId, (childCountById.get(parentNodeId) ?? 0) + 1);
   }
 
+  const retryById = computeRetryInfo(nodeMessages, parentNodeIdById);
+
   const nodes: ConversationGraphNode[] = nodeMessages.map((message) => {
     const isRoot = message.kind === "user";
     const status = isRoot ? undefined : runStatus(message);
@@ -64,6 +70,7 @@ export function buildConversationGraph(options: BuildConversationGraphOptions): 
     return {
       id: message.id,
       kind: isRoot ? "root" : "run",
+      nodeType: nodeTypeOf(message, status),
       messageId: message.id,
       ...(message.runId ? { runId: message.runId } : {}),
       ...(message.agentId ? { agentId: message.agentId } : {}),
@@ -90,6 +97,8 @@ export function buildConversationGraph(options: BuildConversationGraphOptions): 
         ? { ...(planCurrentStep(message) ? { planCurrentStep: planCurrentStep(message) } : {}) }
         : {}),
       childCount: childCountById.get(message.id) ?? 0,
+      obstacleCount: 0,
+      ...(retryById.get(message.id) ? { retry: retryById.get(message.id) } : {}),
     };
   });
   const nodesById = new Map(nodes.map((node) => [node.id, node]));
@@ -127,6 +136,22 @@ export function buildConversationGraph(options: BuildConversationGraphOptions): 
     })
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 
+  // 问题台：可关闭的纯派生投影。派生失败只降级问题台本身（degraded），
+  // 原图（roots/nodes/edges）照常独立返回，绝不因聚类异常丢图。
+  let problems = emptyProblems(options.includeProblems !== false);
+  if (options.includeProblems !== false) {
+    try {
+      problems = buildProblemBoard({ messages: visible, nodes });
+      const countByNode = new Map<string, number>();
+      for (const item of problems.items) {
+        countByNode.set(item.nodeId, (countByNode.get(item.nodeId) ?? 0) + 1);
+      }
+      for (const node of nodes) node.obstacleCount = countByNode.get(node.id) ?? 0;
+    } catch {
+      problems = emptyProblems(true, true);
+    }
+  }
+
   return {
     workspaceId: options.workspaceId,
     conversationId: options.conversationId,
@@ -134,7 +159,73 @@ export function buildConversationGraph(options: BuildConversationGraphOptions): 
     roots,
     nodes,
     edges,
+    problems,
   };
+}
+
+/**
+ * 节点类型（一等概念）：根=指令；run 已完成且有真实产出=结论；其余 run=执行。
+ * 占位文案（"… is working..."）不算产出；拿不准时保守归执行，不硬造结论。
+ */
+function nodeTypeOf(message: ChatMessage, status: ConversationGraphNodeStatus | undefined): ConversationGraphNodeType {
+  if (message.kind === "user") return "instruction";
+  if (status === "completed") {
+    const isPlaceholder = message.content.endsWith(" is working...") || message.content.endsWith(" queued...");
+    if (!isPlaceholder && message.content.trim().length > 0) return "conclusion";
+  }
+  return "execution";
+}
+
+type RetryInfo = NonNullable<ConversationGraphNode["retry"]>;
+
+/**
+ * 重试链识别（保守，只认落盘证据）：同一父节点、同员工、按时间排序的兄弟
+ * run 中，后一次紧跟在一次失败/取消之后发生，才续入同一重试链；链长 >=2
+ * 时非末次尝试标记 folded。已完成后再来的同员工 run 是新任务而非重试，
+ * 不折叠；识别不了的一律不猜、不折叠。
+ */
+function computeRetryInfo(
+  nodeMessages: ChatMessage[],
+  parentNodeIdById: ReadonlyMap<string, string | undefined>,
+): Map<string, RetryInfo> {
+  const groups = new Map<string, ChatMessage[]>();
+  for (const message of nodeMessages) {
+    if (message.kind !== "agent" || !message.runId || !message.agentId) continue;
+    const key = `${parentNodeIdById.get(message.id) ?? ""}|${message.agentId}`;
+    groups.set(key, [...(groups.get(key) ?? []), message]);
+  }
+  const result = new Map<string, RetryInfo>();
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    const sorted = [...group].sort(
+      (a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id),
+    );
+    const chains: ChatMessage[][] = [];
+    let chain: ChatMessage[] = [];
+    for (const message of sorted) {
+      const previous = chain.at(-1);
+      if (previous && (runStatus(previous) === "failed" || runStatus(previous) === "cancelled")) {
+        chain.push(message);
+      } else {
+        if (chain.length > 0) chains.push(chain);
+        chain = [message];
+      }
+    }
+    if (chain.length > 0) chains.push(chain);
+    for (const retryChain of chains) {
+      if (retryChain.length < 2) continue;
+      const groupId = retryChain[0].id;
+      retryChain.forEach((message, index) => {
+        result.set(message.id, {
+          groupId,
+          attempt: index + 1,
+          totalAttempts: retryChain.length,
+          folded: index < retryChain.length - 1,
+        });
+      });
+    }
+  }
+  return result;
 }
 
 /** 最近节点祖先：沿 parentMessageId 上溯，跳过 system 等非节点消息。 */

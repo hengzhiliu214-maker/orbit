@@ -34,6 +34,7 @@ function run(input: {
   routeDepth?: number;
   discarded?: boolean;
   plan?: ChatMessage["plan"];
+  processTimeline?: ChatMessage["processTimeline"];
   startedAt?: string;
   completedAt?: string;
   createdAt?: string;
@@ -51,6 +52,7 @@ function run(input: {
     routeDepth: input.routeDepth,
     discarded: input.discarded,
     plan: input.plan,
+    processTimeline: input.processTimeline,
     startedAt: input.startedAt ?? "2026-06-19T09:02:00.000Z",
     completedAt: input.completedAt ?? "2026-06-19T09:03:00.000Z",
   };
@@ -201,4 +203,153 @@ test("执行中节点带 plan 当前步，排队/取消等状态原样映射", (
   assert.equal(byId.get("b1")?.status, "queued");
   assert.equal(byId.get("b1")?.planCurrentStep, undefined);
   assert.equal(byId.get("c1")?.status, "cancelled");
+});
+
+test("节点类型：根=指令，完成且有产出=结论，进行中=执行", () => {
+  const result = graph([
+    user("u1", "任务", { routeState: "routed" }),
+    run({ id: "a1", parentMessageId: "u1", agentId: "codex", content: "这是最终产出" }),
+    run({ id: "b1", parentMessageId: "u1", agentId: "dsh", runStatus: "running", completedAt: undefined, content: "DeepSeek-Harness is working..." }),
+    run({ id: "c1", parentMessageId: "u1", agentId: "codebuddy", runStatus: "failed", content: "CodeBuddy 运行失败：boom" }),
+  ]);
+  const byId = new Map(result.nodes.map((node) => [node.id, node]));
+  assert.equal(byId.get("u1")?.nodeType, "instruction");
+  assert.equal(byId.get("a1")?.nodeType, "conclusion");
+  assert.equal(byId.get("b1")?.nodeType, "execution");
+  assert.equal(byId.get("c1")?.nodeType, "execution");
+});
+
+test("问题台：失败条目逐字搬运落盘错误文本并可回溯，run 完成后阻碍保留", () => {
+  const result = graph([
+    user("u1", "任务", { routeState: "routed" }),
+    run({ id: "a1", parentMessageId: "u1", agentId: "codex", runStatus: "failed", content: "Codex 运行失败：Session error: -32603 internal error 读取 /tmp/x 失败" }),
+    run({ id: "b1", parentMessageId: "u1", agentId: "dsh", content: "后来成功了" }),
+  ]);
+  const problems = result.problems;
+  assert.equal(problems.enabled, true);
+  assert.equal(problems.totalItems, 1);
+  const item = problems.items[0];
+  assert.equal(item.kind, "run-failed");
+  assert.equal(item.nodeId, "a1");
+  assert.equal(item.messageId, "a1");
+  // 前缀剥离后即落盘错误汇总原文，逐字一致
+  assert.equal(item.text, "Session error: -32603 internal error 读取 /tmp/x 失败");
+  assert.equal(item.errorCode, "-32603");
+  assert.equal(item.source, "record");
+  const byId = new Map(result.nodes.map((node) => [node.id, node]));
+  assert.equal(byId.get("a1")?.obstacleCount, 1);
+  assert.equal(byId.get("b1")?.obstacleCount, 0);
+});
+
+test("问题台判同：同阶段+同错误码+同触发成簇，不同码分开，短句取消保持独立", () => {
+  const fail = (id: string, at: string) =>
+    run({
+      id,
+      parentMessageId: "u1",
+      agentId: "codex",
+      runStatus: "failed",
+      content: "Codex 运行失败：请求失败 -32603 服务内部错误，请稍后重试",
+      createdAt: at,
+    });
+  const result = graph([
+    user("u1", "任务", { routeState: "routed" }),
+    fail("a1", "2026-06-19T09:02:00.000Z"),
+    fail("a2", "2026-06-19T09:05:00.000Z"),
+    run({ id: "b1", parentMessageId: "u1", agentId: "dsh", runStatus: "failed", content: "DeepSeek-Harness 运行失败：ENOENT 找不到文件 /data/a.txt", createdAt: "2026-06-19T09:06:00.000Z" }),
+    run({ id: "c1", parentMessageId: "u1", agentId: "codebuddy", runStatus: "cancelled", content: "运行已取消。", createdAt: "2026-06-19T09:07:00.000Z" }),
+    run({ id: "c2", parentMessageId: "u1", agentId: "codebuddy", runStatus: "cancelled", content: "运行已取消。", createdAt: "2026-06-19T09:08:00.000Z" }),
+  ]);
+  const problems = result.problems;
+  assert.equal(problems.totalItems, 5);
+  const multi = problems.clusters.filter((cluster) => cluster.itemIds.length > 1);
+  assert.equal(multi.length, 1);
+  assert.deepEqual(multi[0].itemIds.length, 2);
+  assert.equal(multi[0].errorCode, "-32603");
+  // 两个取消条目各自独立成簇（信息不足不判同）
+  const cancelClusters = problems.clusters.filter((cluster) => cluster.kind === "run-cancelled");
+  assert.equal(cancelClusters.length, 2);
+  assert.ok(cancelClusters.every((cluster) => cluster.itemIds.length === 1));
+});
+
+test("问题台：工具失败只有结算计数时标 history-summary，阻断与数据不完整如实标注", () => {
+  const result = graph([
+    user("u1", "任务", { routeState: "routed" }),
+    run({
+      id: "a1",
+      parentMessageId: "u1",
+      agentId: "codex",
+      processTimeline: [{ type: "tools", count: 5, failedCount: 2 }],
+    }),
+    run({ id: "b1", parentMessageId: "u1", agentId: "dsh", routeState: "blocked", content: "被阻断的执行" }),
+  ]);
+  const problems = result.problems;
+  const toolItem = problems.items.find((item) => item.kind === "tool-failed");
+  assert.ok(toolItem);
+  assert.equal(toolItem.source, "history-summary");
+  assert.match(toolItem.text, /失败 2 次/);
+  const blockedItem = problems.items.find((item) => item.kind === "route-blocked");
+  assert.ok(blockedItem);
+  assert.equal(blockedItem.nodeId, "b1");
+  assert.equal(problems.dataIncomplete, true);
+});
+
+test("重试折叠：失败后同员工重试成链并折叠非末次，完成后的新任务不折叠", () => {
+  const result = graph([
+    user("u1", "任务", { routeState: "routed" }),
+    run({ id: "a1", parentMessageId: "u1", agentId: "dsh", runStatus: "failed", content: "DeepSeek-Harness 运行失败：-32603 会话失效", createdAt: "2026-06-19T09:02:00.000Z" }),
+    run({ id: "a2", parentMessageId: "u1", agentId: "dsh", content: "重试成功", createdAt: "2026-06-19T09:04:00.000Z" }),
+    run({ id: "b1", parentMessageId: "u1", agentId: "codex", content: "第一个任务", createdAt: "2026-06-19T09:05:00.000Z" }),
+    run({ id: "b2", parentMessageId: "u1", agentId: "codex", content: "第二个任务", createdAt: "2026-06-19T09:06:00.000Z" }),
+  ]);
+  const byId = new Map(result.nodes.map((node) => [node.id, node]));
+  assert.equal(byId.get("a1")?.retry?.folded, true);
+  assert.equal(byId.get("a1")?.retry?.attempt, 1);
+  assert.equal(byId.get("a2")?.retry?.folded, false);
+  assert.equal(byId.get("a2")?.retry?.attempt, 2);
+  assert.equal(byId.get("a2")?.retry?.totalAttempts, 2);
+  assert.equal(byId.get("a1")?.retry?.groupId, byId.get("a2")?.retry?.groupId);
+  assert.equal(byId.get("b1")?.retry, undefined);
+  assert.equal(byId.get("b2")?.retry, undefined);
+});
+
+test("问题台可关闭：includeProblems=false 时原图不变且计数为 0", () => {
+  const messages = [
+    user("u1", "任务", { routeState: "routed" }),
+    run({ id: "a1", parentMessageId: "u1", agentId: "codex", runStatus: "failed", content: "Codex 运行失败：-32603 出错了啊啊啊" }),
+  ];
+  const off = buildConversationGraph({
+    workspaceId: "ws-1",
+    conversationId: "conv-1",
+    messages,
+    agentLabels: labels,
+    agentRuntimes: runtimes,
+    includeProblems: false,
+  });
+  assert.equal(off.problems.enabled, false);
+  assert.equal(off.problems.items.length, 0);
+  assert.equal(off.nodes.length, 2);
+  assert.equal(off.nodes.find((node) => node.id === "a1")?.obstacleCount, 0);
+  const on = graph(messages);
+  assert.equal(on.nodes.length, off.nodes.length);
+  assert.equal(on.edges.length, off.edges.length);
+});
+
+test("问题台上限：条目超限时截断并如实标注", () => {
+  const messages: ChatMessage[] = [user("u1", "任务", { routeState: "routed" })];
+  for (let i = 0; i < 210; i++) {
+    messages.push(
+      run({
+        id: `f${i}`,
+        parentMessageId: "u1",
+        agentId: "codex",
+        runStatus: "failed",
+        content: `Codex 运行失败：错误 ${i} 发生了奇怪的问题需要处理`,
+        createdAt: `2026-06-19T10:${String(i % 60).padStart(2, "0")}:00.000Z`,
+      }),
+    );
+  }
+  const result = graph(messages);
+  assert.equal(result.problems.totalItems, 210);
+  assert.equal(result.problems.items.length, 200);
+  assert.equal(result.problems.truncated, true);
 });

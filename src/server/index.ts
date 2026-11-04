@@ -924,6 +924,7 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 409, { ok: false, message: "workspaceId and conversationId are required." });
         return;
       }
+      const includeProblems = url.searchParams.get("problems") !== "0";
       const ctx = contextForTarget(target);
       if (!ctx) {
         sendJson(res, 200, {
@@ -933,6 +934,7 @@ const server = http.createServer(async (req, res) => {
           roots: [],
           nodes: [],
           edges: [],
+          problems: { enabled: includeProblems, items: [], clusters: [], totalItems: 0, truncated: false, dataIncomplete: false },
         });
         return;
       }
@@ -955,6 +957,7 @@ const server = http.createServer(async (req, res) => {
         messages: projected,
         agentLabels,
         agentRuntimes,
+        includeProblems,
       }));
       return;
     }

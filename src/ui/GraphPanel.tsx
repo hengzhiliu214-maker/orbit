@@ -21,6 +21,9 @@ import type {
   ConversationGraph,
   ConversationGraphNode,
   ConversationGraphNodeStatus,
+  ConversationGraphNodeType,
+  ConversationGraphProblemItem,
+  ConversationGraphProblemKind,
 } from "../shared/types.ts";
 
 const NODE_WIDTH = 216;
@@ -35,11 +38,26 @@ const STATUS_LABELS: Record<ConversationGraphNodeStatus, string> = {
   cancelled: "已取消",
 };
 
+const NODE_TYPE_LABELS: Record<ConversationGraphNodeType, string> = {
+  instruction: "指令",
+  execution: "执行",
+  conclusion: "结论",
+};
+
+const PROBLEM_KIND_LABELS: Record<ConversationGraphProblemKind, string> = {
+  "run-failed": "执行失败",
+  "run-cancelled": "执行取消",
+  "route-blocked": "派发被阻断",
+  "tool-failed": "工具失败",
+};
+
 type GraphNodeData = {
   graphNode: ConversationGraphNode;
   hasChildren: boolean;
   collapsed: boolean;
   onToggleCollapse: (nodeId: string) => void;
+  retryExpanded: boolean;
+  onToggleRetry: (groupId: string) => void;
   [key: string]: unknown;
 };
 
@@ -55,8 +73,10 @@ function GraphNodeCard({ data }: NodeProps<FlowNode>) {
       <div className="graphNodeHead">
         <span className={`graphStatusDot ${node.status ?? "root"}`} aria-hidden="true" />
         <strong className="graphNodeAuthor">{author}</strong>
+        <span className={`graphTypeBadge type-${node.nodeType}`}>{NODE_TYPE_LABELS[node.nodeType]}</span>
         {node.runtime ? <span className="graphRuntimeBadge">{node.runtime}</span> : null}
         {node.origin === "supervisor" && !isRoot ? <span className="graphOriginBadge">监工派发</span> : null}
+        {node.obstacleCount > 0 ? <span className="graphObstacleBadge">阻碍 ×{node.obstacleCount}</span> : null}
         {data.hasChildren ? (
           <button
             type="button"
@@ -72,6 +92,20 @@ function GraphNodeCard({ data }: NodeProps<FlowNode>) {
         ) : null}
       </div>
       <div className="graphNodeTitle" title={node.title}>{node.title}</div>
+      {node.retry && !node.retry.folded && node.retry.totalAttempts > 1 ? (
+        <button
+          type="button"
+          className="graphRetryBtn"
+          title={data.retryExpanded ? "收起之前的尝试" : "展开之前的尝试"}
+          onClick={(event) => {
+            event.stopPropagation();
+            data.onToggleRetry(node.retry!.groupId);
+          }}
+        >
+          第 {node.retry.attempt} 次尝试 · 含 {node.retry.totalAttempts - 1} 次重试{data.retryExpanded ? "（收起）" : "（展开）"}
+        </button>
+      ) : null}
+      {node.retry?.folded ? <div className="graphNodeStep">第 {node.retry.attempt} 次尝试（已折叠）</div> : null}
       {node.planCurrentStep ? <div className="graphNodeStep">当前步：{node.planCurrentStep}</div> : null}
       <div className="graphNodeMeta">
         {node.status ? <span>{STATUS_LABELS[node.status]}</span> : <span>任务</span>}
@@ -113,6 +147,16 @@ function GraphCanvas(props: {
 }) {
   const { graph, selectedRootId } = props;
   const [collapsedIds, setCollapsedIds] = useState<ReadonlySet<string>>(new Set());
+  const [expandedRetryGroups, setExpandedRetryGroups] = useState<ReadonlySet<string>>(new Set());
+
+  const toggleRetry = useCallback((groupId: string) => {
+    setExpandedRetryGroups((current) => {
+      const next = new Set(current);
+      if (next.has(groupId)) next.delete(groupId);
+      else next.add(groupId);
+      return next;
+    });
+  }, []);
   const [flowNodes, setFlowNodes, onNodesChange] = useNodesState<FlowNode>([]);
   const [flowEdges, setFlowEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const positionsRef = useRef(new Map<string, { x: number; y: number }>());
@@ -122,6 +166,7 @@ function GraphCanvas(props: {
 
   useEffect(() => {
     setCollapsedIds(new Set());
+    setExpandedRetryGroups(new Set());
     positionsRef.current.clear();
     structureKeyRef.current = "";
     fittedRootRef.current = "";
@@ -147,6 +192,13 @@ function GraphCanvas(props: {
     }
     const hidden = new Set<string>();
     const stack = members.filter((node) => collapsedIds.has(node.id)).map((node) => node.id);
+    // 重试折叠：非末次尝试默认隐藏（连同其后代），在末次尝试节点上可展开。
+    for (const node of members) {
+      if (node.retry?.folded && !expandedRetryGroups.has(node.retry.groupId)) {
+        hidden.add(node.id);
+        stack.push(node.id);
+      }
+    }
     while (stack.length > 0) {
       const current = stack.pop()!;
       for (const child of childrenByParent.get(current) ?? []) {
@@ -162,7 +214,7 @@ function GraphCanvas(props: {
       (edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target),
     );
     return { visibleNodes, visibleEdges };
-  }, [graph, selectedRootId, collapsedIds]);
+  }, [graph, selectedRootId, collapsedIds, expandedRetryGroups]);
 
   useEffect(() => {
     const { visibleNodes, visibleEdges } = visible;
@@ -197,6 +249,8 @@ function GraphCanvas(props: {
         hasChildren: node.childCount > 0,
         collapsed: collapsedIds.has(node.id),
         onToggleCollapse: toggleCollapse,
+        retryExpanded: node.retry ? expandedRetryGroups.has(node.retry.groupId) : false,
+        onToggleRetry: toggleRetry,
       },
     })));
     setFlowEdges(visibleEdges.map((edge) => {
@@ -217,7 +271,7 @@ function GraphCanvas(props: {
       }, 60);
       return () => window.clearTimeout(timer);
     }
-  }, [visible, graph.nodes, selectedRootId, collapsedIds, toggleCollapse, reactFlow, setFlowNodes, setFlowEdges]);
+  }, [visible, graph.nodes, selectedRootId, collapsedIds, toggleCollapse, expandedRetryGroups, toggleRetry, reactFlow, setFlowNodes, setFlowEdges]);
 
   if (graph.roots.length === 0) {
     return <div className="graphEmpty">本会话还没有任务链。发出一条指派消息后，这里会长出工作树。</div>;
@@ -245,6 +299,160 @@ function GraphCanvas(props: {
   );
 }
 
+function ProblemItemCard(props: {
+  item: ConversationGraphProblemItem;
+  expanded: boolean;
+  onToggleExpand: (itemId: string) => void;
+  onLocateMessage: (messageId: string) => void;
+}) {
+  const { item } = props;
+  const longText = item.text.length > 220;
+  return (
+    <div className="problemItem">
+      <div className="problemItemHead">
+        <span className={`problemKindBadge kind-${item.kind}`}>{PROBLEM_KIND_LABELS[item.kind]}</span>
+        {item.agentLabel ? <span className="problemAgent">{item.agentLabel}</span> : null}
+        <span className="problemTime">{formatTime(item.completedAt ?? item.createdAt)}</span>
+        <span className="problemSource">
+          {item.source === "history-summary" ? "历史摘要／事件未留存" : "与记录一致"}
+        </span>
+      </div>
+      <div className={`problemText${longText && !props.expanded ? " clamped" : ""}`}>{item.text}</div>
+      {longText ? (
+        <button type="button" className="problemExpandBtn" onClick={() => props.onToggleExpand(item.id)}>
+          {props.expanded ? "收起" : "展开全文（仅显示折叠，原文未删）"}
+        </button>
+      ) : null}
+      <div className="problemItemFoot">
+        <span className="problemNodeId">节点 {item.nodeId}</span>
+        <button type="button" className="problemLocateBtn" onClick={() => props.onLocateMessage(item.messageId)}>
+          回到原节点
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ProblemBoard(props: {
+  graph: ConversationGraph | null;
+  error: string | null;
+  problemsEnabled: boolean;
+  onToggleProblems: (enabled: boolean) => void;
+  onLocateMessage: (messageId: string) => void;
+}) {
+  const [expandedItems, setExpandedItems] = useState<ReadonlySet<string>>(new Set());
+  const [expandedClusters, setExpandedClusters] = useState<ReadonlySet<string>>(new Set());
+  const toggleItem = useCallback((itemId: string) => {
+    setExpandedItems((current) => {
+      const next = new Set(current);
+      if (next.has(itemId)) next.delete(itemId);
+      else next.add(itemId);
+      return next;
+    });
+  }, []);
+  const toggleCluster = useCallback((clusterId: string) => {
+    setExpandedClusters((current) => {
+      const next = new Set(current);
+      if (next.has(clusterId)) next.delete(clusterId);
+      else next.add(clusterId);
+      return next;
+    });
+  }, []);
+
+  const header = (
+    <div className="problemBoardHead">
+      <span className="problemBoardNote">
+        只抽取阻碍条目，同因成簇。条目文字与落盘记录逐字一致；记录在服务端可能已汇总或截断，不代表原始错误全文。
+      </span>
+      <label className="problemToggle">
+        <input
+          type="checkbox"
+          checked={props.problemsEnabled}
+          onChange={(event) => props.onToggleProblems(event.target.checked)}
+        />
+        聚类
+      </label>
+    </div>
+  );
+
+  if (!props.graph) {
+    return (
+      <div className="problemBoard">
+        {header}
+        <div className="graphEmpty">{props.error ?? "加载中…"}</div>
+      </div>
+    );
+  }
+  const problems = props.graph.problems;
+  if (!problems || !problems.enabled) {
+    return (
+      <div className="problemBoard">
+        {header}
+        <div className="graphEmpty">聚类已关闭，问题台未启用。左侧指令链不受影响，照常显示。</div>
+      </div>
+    );
+  }
+  if (problems.degraded) {
+    return (
+      <div className="problemBoard">
+        {header}
+        <div className="graphEmpty">问题台暂时不可用（聚类派生异常，已自动降级）。左侧指令链不受影响。</div>
+      </div>
+    );
+  }
+  const itemsById = new Map(problems.items.map((item) => [item.id, item]));
+  return (
+    <div className="problemBoard">
+      {header}
+      {problems.dataIncomplete ? (
+        <div className="problemIncomplete">数据不完整：历史仅保留结算记录，过程事件未留存；工具类条目只有结算计数。</div>
+      ) : null}
+      {problems.truncated ? (
+        <div className="problemIncomplete">条目较多，已按上限截断显示（共 {problems.totalItems} 条）。</div>
+      ) : null}
+      {problems.items.length === 0 ? (
+        <div className="graphEmpty">目前没有记录到阻碍。</div>
+      ) : (
+        problems.clusters.map((cluster) => {
+          const items = cluster.itemIds
+            .map((id) => itemsById.get(id))
+            .filter((item): item is ConversationGraphProblemItem => Boolean(item));
+          if (items.length === 0) return null;
+          const first = items[0];
+          const multi = items.length > 1;
+          const open = !multi || expandedClusters.has(cluster.id);
+          return (
+            <div key={cluster.id} className="problemCluster">
+              <button
+                type="button"
+                className="problemClusterHead"
+                onClick={() => multi && toggleCluster(cluster.id)}
+                aria-expanded={open}
+              >
+                <span className={`problemKindBadge kind-${cluster.kind}`}>{PROBLEM_KIND_LABELS[cluster.kind]}</span>
+                {cluster.errorCode ? <span className="problemCode">{cluster.errorCode}</span> : null}
+                <span className="problemClusterTitle">{first.text}</span>
+                {multi ? <span className="problemClusterCount">同因 ×{items.length}{open ? "（收起）" : "（展开）"}</span> : null}
+              </button>
+              {open
+                ? items.map((item) => (
+                    <ProblemItemCard
+                      key={item.id}
+                      item={item}
+                      expanded={expandedItems.has(item.id)}
+                      onToggleExpand={toggleItem}
+                      onLocateMessage={props.onLocateMessage}
+                    />
+                  ))
+                : null}
+            </div>
+          );
+        })
+      )}
+    </div>
+  );
+}
+
 export function GraphPanel(props: {
   workspaceId: string;
   conversationId: string;
@@ -257,6 +465,8 @@ export function GraphPanel(props: {
   const [graph, setGraph] = useState<ConversationGraph | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedRootId, setSelectedRootId] = useState<string>("");
+  const [activeTab, setActiveTab] = useState<"tree" | "problems">("tree");
+  const [problemsEnabled, setProblemsEnabled] = useState(true);
   const followLatestRef = useRef(true);
   const graphRef = useRef<ConversationGraph | null>(null);
   graphRef.current = graph;
@@ -264,6 +474,7 @@ export function GraphPanel(props: {
   const fetchGraph = useCallback(async (signal: AbortSignal) => {
     if (!props.workspaceId || !props.conversationId) return;
     const query = new URLSearchParams({ workspaceId: props.workspaceId, conversationId: props.conversationId });
+    if (!problemsEnabled) query.set("problems", "0");
     const response = await fetch(
       `/api/conversations/${encodeURIComponent(props.conversationId)}/graph?${query.toString()}`,
       { signal },
@@ -281,7 +492,7 @@ export function GraphPanel(props: {
       }
       return current;
     });
-  }, [props.workspaceId, props.conversationId]);
+  }, [props.workspaceId, props.conversationId, problemsEnabled]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -311,6 +522,7 @@ export function GraphPanel(props: {
     followLatestRef.current = true;
     setSelectedRootId("");
     setGraph(null);
+    setActiveTab("tree");
   }, [props.conversationId]);
 
   const roots = graph?.roots ?? [];
@@ -325,7 +537,39 @@ export function GraphPanel(props: {
           ×
         </button>
       </header>
-      {roots.length > 1 ? (
+      <div className="graphTabs" role="tablist" aria-label="指令链面板页签">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === "tree"}
+          className={`graphTabBtn${activeTab === "tree" ? " active" : ""}`}
+          onClick={() => setActiveTab("tree")}
+        >
+          指令链
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === "problems"}
+          className={`graphTabBtn${activeTab === "problems" ? " active" : ""}`}
+          onClick={() => setActiveTab("problems")}
+        >
+          问题台
+          {graph?.problems?.enabled && graph.problems.totalItems > 0 ? (
+            <span className="graphTabCount">{graph.problems.totalItems}</span>
+          ) : null}
+        </button>
+      </div>
+      {activeTab === "problems" ? (
+        <ProblemBoard
+          graph={graph}
+          error={error}
+          problemsEnabled={problemsEnabled}
+          onToggleProblems={setProblemsEnabled}
+          onLocateMessage={props.onLocateMessage}
+        />
+      ) : null}
+      {activeTab === "tree" && roots.length > 1 ? (
         <div className="graphRootBar" role="tablist" aria-label="选择根任务">
           {roots.map((root) => (
             <button
@@ -346,17 +590,19 @@ export function GraphPanel(props: {
           ))}
         </div>
       ) : null}
-      <div className="graphCanvasWrap">
-        {graph ? (
-          <ReactFlowProvider>
-            <GraphCanvas graph={graph} selectedRootId={selectedRootId} onLocateMessage={props.onLocateMessage} />
-          </ReactFlowProvider>
-        ) : error ? (
-          <div className="graphEmpty">{error}</div>
-        ) : (
-          <div className="graphEmpty">加载中…</div>
-        )}
-      </div>
+      {activeTab === "tree" ? (
+        <div className="graphCanvasWrap">
+          {graph ? (
+            <ReactFlowProvider>
+              <GraphCanvas graph={graph} selectedRootId={selectedRootId} onLocateMessage={props.onLocateMessage} />
+            </ReactFlowProvider>
+          ) : error ? (
+            <div className="graphEmpty">{error}</div>
+          ) : (
+            <div className="graphEmpty">加载中…</div>
+          )}
+        </div>
+      ) : null}
     </aside>
   );
 }

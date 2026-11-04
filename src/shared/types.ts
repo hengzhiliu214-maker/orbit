@@ -494,9 +494,13 @@ export type ConversationGraphNodeStatus = "queued" | "running" | "cancelling" | 
  * 直接父消息为 system（监工指令消息）或父节点为监工本人时记 supervisor。
  * 注意：落盘数据没有逐 run 的模型名，节点只带员工显示名与 runtime。
  */
+/** 节点类型（一等概念）：指令=根用户指令；执行=进行中的 run；结论=已完成且有产出的终态 run；阻碍不占树节点，见 ConversationGraphProblemItem。 */
+export type ConversationGraphNodeType = "instruction" | "execution" | "conclusion";
+
 export type ConversationGraphNode = {
   id: string;
   kind: "root" | "run";
+  nodeType: ConversationGraphNodeType;
   messageId: string;
   runId?: string;
   agentId?: AgentId;
@@ -517,6 +521,10 @@ export type ConversationGraphNode = {
   /** 正在执行的节点当前 plan 步（仅 items 格式 plan 且有 in_progress 条目时）。 */
   planCurrentStep?: string;
   childCount: number;
+  /** 该节点关联的阻碍条目数（问题台派生计数；0 时前端不渲染徽标）。 */
+  obstacleCount: number;
+  /** 重试折叠信息：同父同员工的重试链中，非末次尝试 folded=true，前端默认折叠到末次尝试下。 */
+  retry?: { groupId: string; attempt: number; totalAttempts: number; folded: boolean };
 };
 
 export type ConversationGraphEdge = {
@@ -538,6 +546,58 @@ export type ConversationGraphRoot = {
   latestActivityAt: string;
 };
 
+/** 问题台条目类别：失败 / 取消 / 路由阻断 / 工具失败（结算计数）。 */
+export type ConversationGraphProblemKind = "run-failed" | "run-cancelled" | "route-blocked" | "tool-failed";
+
+/**
+ * 问题台的一条阻碍记录。text 为落盘字段的逐字搬运（不摘要、不改写）；
+ * 注意落盘字段本身在服务端可能已经过汇总/截断，故口径是「与记录一致」，
+ * 不声称等同未处理的原始错误。nodeId 可回溯到工作树节点。
+ * source: "record" = 落盘消息字段；"history-summary" = 仅有结算摘要
+ * （过程事件未留存，如工具失败只有计数）。
+ */
+export type ConversationGraphProblemItem = {
+  id: string;
+  nodeId: string;
+  messageId: string;
+  kind: ConversationGraphProblemKind;
+  /** 失败阶段：run / route / tool。 */
+  stage: string;
+  errorCode?: string;
+  text: string;
+  source: "record" | "history-summary";
+  agentId?: AgentId;
+  agentLabel?: string;
+  createdAt: string;
+  completedAt?: string;
+};
+
+/** 同因簇：指纹 = 阶段 + 错误码 + 归一化触发文本（保守判同，见 conversation-problems）。 */
+export type ConversationGraphProblemCluster = {
+  id: string;
+  fingerprint: string;
+  kind: ConversationGraphProblemKind;
+  stage: string;
+  errorCode?: string;
+  itemIds: string[];
+};
+
+/**
+ * 问题台：由 graph DTO 纯派生（可关闭、失败可降级），不落盘、不作持久事实。
+ * truncated 表示条目/簇数触及上限被截断；dataIncomplete 表示历史只有结算
+ * 记录、过程事件未留存，数据不完整须在界面可见。
+ */
+export type ConversationGraphProblems = {
+  enabled: boolean;
+  /** 聚类派生失败时的降级标记：原图照常返回，问题台不可用。 */
+  degraded?: boolean;
+  items: ConversationGraphProblemItem[];
+  clusters: ConversationGraphProblemCluster[];
+  totalItems: number;
+  truncated: boolean;
+  dataIncomplete: boolean;
+};
+
 export type ConversationGraph = {
   workspaceId: string;
   conversationId: string;
@@ -545,6 +605,7 @@ export type ConversationGraph = {
   roots: ConversationGraphRoot[];
   nodes: ConversationGraphNode[];
   edges: ConversationGraphEdge[];
+  problems: ConversationGraphProblems;
 };
 
 export type MessageHistoryState = {
