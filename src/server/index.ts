@@ -26,7 +26,7 @@ import { initialAgentConfigsForWorkspacePreset } from "../core/workspace-agent-p
 import { getWorkspacePresets } from "../core/workspace-presets.ts";
 import { migrateChannelLayer } from "../core/migrate-channel-layer.ts";
 import { cleanupHistory } from "../core/history-retention.ts";
-import type { AgentCommandsSnapshot, AgentConfigWithModelState, AgentModelProbeResponse, AgentModelProbeState, ApprovalMode, Conversation, ConversationInfo, ElicitationResponse, InteractionMode, MessagePage, PermissionDecision, RunningSummary, SupervisorConfig, WorkspaceInfo, AgentId } from "../shared/types.ts";
+import type { AgentCommandsSnapshot, AgentConfigWithModelState, AgentModelProbeResponse, AgentModelProbeState, AgentModelStateSnapshot, ApprovalMode, Conversation, ConversationInfo, ElicitationResponse, InteractionMode, MessagePage, PermissionDecision, RunningSummary, SupervisorConfig, WorkspaceInfo, AgentId } from "../shared/types.ts";
 import { isAgentRuntimeKind, isInteractionMode } from "../shared/types.ts";
 import { ATTACHMENT_LIMITS } from "../shared/types.ts";
 import { AttachmentStore } from "../core/attachment-store.ts";
@@ -120,6 +120,30 @@ async function probeRuntimes(): Promise<void> {
   }
 }
 
+// 模型探针在飞去重：同一工作区同一运行时的并发请求共享一次真实探测。
+// 昂贵的是 app-server 冷启动与首个 session/new（实测热态 3–6s、冷态 14–20s），
+// 重复并发只会互相拖慢。只共享探测本身；每个调用方仍按自己的目标与存储键
+// 回写快照，currentValueSource 与会话优先等既有合同不变。
+const modelProbeInFlight = new Map<string, Promise<AgentModelStateSnapshot | null>>();
+
+function sharedModelProbe(
+  workspaceId: string,
+  definition: Parameters<typeof probeAcpModelState>[0],
+  agentId: string,
+  cwd: string,
+): Promise<AgentModelStateSnapshot | null> {
+  const key = `${workspaceId}\n${definition.kind}`;
+  const inFlight = modelProbeInFlight.get(key);
+  if (inFlight) return inFlight;
+  const promise = probeAcpModelState(definition, { agentId, cwd });
+  modelProbeInFlight.set(key, promise);
+  const cleanup = () => {
+    if (modelProbeInFlight.get(key) === promise) modelProbeInFlight.delete(key);
+  };
+  promise.then(cleanup, cleanup);
+  return promise;
+}
+
 async function probeConfiguredAgentModels(
   force = false,
   runtimeFilter?: AgentConfig["runtime"],
@@ -136,6 +160,19 @@ async function probeConfiguredAgentModels(
   const targetsByRuntime = new Map<AgentConfig["runtime"], Array<Pick<AgentConfig, "id" | "runtime">>>();
   if (runtimeFilter && targetAgentId) {
     targetsByRuntime.set(runtimeFilter, [{ id: targetAgentId, runtime: runtimeFilter }]);
+    if (!force) {
+      // 定点非强制（监工面板打开等）且已有同运行时快照：先返回快照、后台刷新
+      // （stale-while-revalidate）。冷探针实测 3–20s，让界面干等没有收益；
+      // 刷新完成后经既有 SSE agent.model_state 回推新快照，updatedAt 仍以真实
+      // 探针完成时刻为准，不做假刷新。无快照时仍同步探测（无旧数据可先行展示）。
+      const storageKey = targetAgentId === INTERNAL_SUPERVISOR_ID && targetConversationId !== undefined
+        ? supervisorStorageKey(targetConversationId)
+        : targetAgentId;
+      if (existing[storageKey]?.runtimeKind === runtimeFilter) {
+        void executeModelProbes(workspaceId, workspace, targetsByRuntime, targetConversationId).catch(() => {});
+        return;
+      }
+    }
   } else {
     for (const config of configStore.load(workspaceId)) {
       if (runtimeFilter && config.runtime !== runtimeFilter) continue;
@@ -148,6 +185,16 @@ async function probeConfiguredAgentModels(
     }
   }
 
+  await executeModelProbes(workspaceId, workspace, targetsByRuntime, targetConversationId);
+}
+
+async function executeModelProbes(
+  workspaceId: string,
+  workspace: Pick<WorkspaceInfo, "path">,
+  targetsByRuntime: Map<AgentConfig["runtime"], Array<Pick<AgentConfig, "id" | "runtime">>>,
+  targetConversationId?: string,
+): Promise<void> {
+  const existing = agentModelStateStore.load(workspaceId);
   await Promise.all([...targetsByRuntime.entries()].map(async ([runtimeKind, targets]) => {
     const registration = defaultAcpRunnerRegistry.get(runtimeKind);
     if (!registration) {
@@ -161,10 +208,7 @@ async function probeConfiguredAgentModels(
     setModelProbeState(workspaceId, runtimeKind, { runtimeKind, status: "loading" });
     try {
       const first = targets[0]!;
-      const snapshot = await probeAcpModelState(registration.definition, {
-        agentId: first.id,
-        cwd: workspace.path,
-      });
+      const snapshot = await sharedModelProbe(workspaceId, registration.definition, first.id, workspace.path);
       if (!snapshot) {
         setModelProbeState(workspaceId, runtimeKind, {
           runtimeKind,
@@ -634,6 +678,8 @@ function switchWorkspace(workspaceId: string): void {
   activeConversation = EMPTY_CONVERSATION;
   saveLastActive(activeWorkspaceId, activeConversationId);
 
+  // 切到新工作区后后台补齐缺失的模型快照，面板打开时不必冷等（非强制语义）。
+  void probeConfiguredAgentModels(false, undefined, undefined, workspaceId).catch(() => {});
 }
 
 function refreshEnabledAgentsForWorkspace(workspaceId: string, configs: AgentConfig[]): void {
@@ -1831,6 +1877,9 @@ const server = http.createServer(async (req, res) => {
   });
   await startServerWithRecovery();
   startPeriodicProbe();
+  // 后台预热模型快照：非强制语义只补缺失/出错的运行时，让首次打开设置面板
+  // 时已有清单可用，不必等冷探针；不阻塞启动，失败只记日志不影响服务。
+  void probeConfiguredAgentModels(false).catch(() => {});
 })();
 
 async function startServerWithRecovery(): Promise<void> {

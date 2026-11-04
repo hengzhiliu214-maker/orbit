@@ -2531,6 +2531,7 @@ export function App() {
       ) : null}
       {showSupervisorSettings ? (
         <SupervisorSettingsPanel
+          liveModelState={state.agentModelStates[INTERNAL_SUPERVISOR_ID]}
           workspaceId={state.workspace.id}
           conversationId={state.conversation.id}
           config={supervisorConfig}
@@ -4282,6 +4283,7 @@ function PlainText({ content }: { content: string }) {
  * - 偏好按 runtime 归属门控：换运行时后旧偏好既不生效也不展示。
  */
 function SupervisorSettingsPanel({
+  liveModelState,
   workspaceId,
   conversationId,
   config,
@@ -4289,6 +4291,7 @@ function SupervisorSettingsPanel({
   onClose,
   onSave,
 }: {
+  liveModelState?: AgentModelStateSnapshot;
   workspaceId: string;
   conversationId: string;
   config: SupervisorConfig;
@@ -4327,6 +4330,16 @@ function SupervisorSettingsPanel({
       setIsRefreshing(false);
     }
   }
+
+  // 服务端定点非强制探测走 stale-while-revalidate：打开时先给已存快照，
+  // 后台刷新完成的新快照经 SSE 到达后实时采纳，免得面板停在打开时的旧清单。
+  // 只采纳同运行时的快照；updatedAt 相同视为同一份，不重复替换。
+  useEffect(() => {
+    if (!liveModelState || liveModelState.runtimeKind !== runtime) return;
+    setSnapshot((current) => (
+      current && current.updatedAt === liveModelState.updatedAt ? current : liveModelState
+    ));
+  }, [liveModelState, runtime]);
 
   // 首次打开按需探测当前监工的运行时；切换运行时后再探测一次新的。
   useEffect(() => {
