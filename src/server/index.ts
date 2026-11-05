@@ -12,6 +12,27 @@ import { AGENT_TEAM_TEMPLATES, AgentConfigStore, validateAgentConfigs } from "..
 import { AgentModelStateStore, supervisorStorageKey } from "../core/agent-model-state-store.ts";
 import { findStaleSnapshotPreferenceOverwrite } from "../core/agent-model-guard.ts";
 import { buildConversationGraph } from "../core/conversation-graph.ts";
+import {
+  assembleHandoffMaterial,
+  checkpointConfigFromEnv,
+  checkpointDir,
+  checkpointsWriteEnabled,
+  claimHandoffOperation,
+  createCheckpoint,
+  deleteCheckpoint,
+  emptyCheckpoints,
+  readConversationSnapshot,
+  readManifest,
+  readOperations,
+  sha256Hex,
+  stripProblemsText,
+  summarizeCheckpoints,
+  writeHandoffRecord,
+  writeOperation,
+  CheckpointError,
+  type ConversationSnapshot,
+  type CheckpointManifest,
+} from "../core/conversation-checkpoints.ts";
 import { probeAllRuntimes, runtimeKindToCliKey, type RuntimeProbeResult } from "../core/runtime-probe.ts";
 import type { AgentConfig } from "../core/agent-config-store.ts";
 import { WorkspaceConfigStore } from "../core/workspace-config-store.ts";
@@ -27,7 +48,7 @@ import { initialAgentConfigsForWorkspacePreset } from "../core/workspace-agent-p
 import { getWorkspacePresets } from "../core/workspace-presets.ts";
 import { migrateChannelLayer } from "../core/migrate-channel-layer.ts";
 import { cleanupHistory } from "../core/history-retention.ts";
-import type { AgentCommandsSnapshot, AgentConfigWithModelState, AgentModelProbeResponse, AgentModelProbeState, AgentModelStateSnapshot, ApprovalMode, Conversation, ConversationInfo, ElicitationResponse, InteractionMode, MessagePage, PermissionDecision, RunningSummary, SupervisorConfig, WorkspaceInfo, AgentId, ChatMessage } from "../shared/types.ts";
+import type { AgentCommandsSnapshot, AgentConfigWithModelState, AgentModelProbeResponse, AgentModelProbeState, AgentModelStateSnapshot, ApprovalMode, Conversation, ConversationGraph, ConversationGraphCheckpoints, ConversationGraphProblems, ConversationGraphSessions, ConversationInfo, ElicitationResponse, InteractionMode, MessagePage, PermissionDecision, RunningSummary, SupervisorConfig, WorkspaceInfo, AgentId, ChatMessage } from "../shared/types.ts";
 import { isAgentRuntimeKind, isInteractionMode } from "../shared/types.ts";
 import { ATTACHMENT_LIMITS } from "../shared/types.ts";
 import { AttachmentStore } from "../core/attachment-store.ts";
@@ -765,9 +786,157 @@ function currentAgentStates() {
     }));
 }
 
+
+// --- 检查点（第二步 v1）：独立端点组 + 独立开关；只读聚合经 graph DTO 旁路。 ---
+
+const checkpointConfig = checkpointConfigFromEnv();
+const handoffLocks = new Map<string, Promise<void>>();
+
+async function withCheckpointLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const previous = handoffLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  handoffLocks.set(key, previous.then(() => current));
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
+function checkpointsBlockFor(workspaceId: string, conversationId: string, enabled: boolean): ConversationGraphCheckpoints {
+  const writeEnabled = checkpointsWriteEnabled();
+  if (!enabled) return emptyCheckpoints(false, writeEnabled, false, checkpointConfig);
+  try {
+    const conversationDir = workspaceStore.channelsDir(workspaceId, conversationId);
+    return summarizeCheckpoints({
+      conversationDir,
+      workspaceConversationsRoot: path.dirname(conversationDir),
+      writeEnabled,
+      config: checkpointConfig,
+    });
+  } catch {
+    return emptyCheckpoints(true, writeEnabled, true, checkpointConfig);
+  }
+}
+
+function sendCheckpointError(res: http.ServerResponse, error: unknown): void {
+  if (error instanceof CheckpointError) {
+    const status = error.code === "cap-count" || error.code === "cap-bytes" || error.code === "snapshot-changed" || error.code === "excerpt-stale"
+      ? 409
+      : error.code === "not-found" || error.code === "snapshot-missing"
+        ? 404
+        : error.code === "invalid-id"
+          ? 400
+          : 422;
+    sendJson(res, status, { ok: false, code: error.code, message: error.message });
+    return;
+  }
+  sendJson(res, 500, { ok: false, message: error instanceof Error ? error.message : String(error) });
+}
+
+/** 以同一份落盘快照派生第一步会话状态与问题台（与 graph DTO 同一实现）。 */
+function checkpointDerivations(
+  target: RequestTarget,
+  ctx: ConversationContext,
+  snapshot: ConversationSnapshot,
+): { sessions: ConversationGraphSessions; problems: ConversationGraphProblems } {
+  const agentLabels = new Map<AgentId, string>();
+  const agentRuntimes = new Map<AgentId, string>();
+  for (const agentState of ctx.agents.states()) {
+    agentLabels.set(agentState.id, agentState.label);
+    agentRuntimes.set(agentState.id, agentState.runtime);
+  }
+  const graph = buildConversationGraph({
+    workspaceId: target.workspaceId,
+    conversationId: target.conversationId,
+    messages: snapshot.messages,
+    agentLabels,
+    agentRuntimes,
+    includeProblems: true,
+    includeSessions: true,
+  });
+  return { sessions: graph.sessions, problems: graph.problems };
+}
+
+function handoffMaterialFor(
+  target: RequestTarget,
+  ctx: ConversationContext,
+  conversationDir: string,
+  manifest: CheckpointManifest,
+) {
+  const snapshot = readConversationSnapshot(conversationDir);
+  const { sessions, problems } = checkpointDerivations(target, ctx, snapshot);
+  const material = assembleHandoffMaterial({
+    checkpointId: manifest.checkpointId,
+    checkpointCreatedAt: manifest.createdAt,
+    contentKey: manifest.contentKey,
+    sourceConversationId: target.conversationId,
+    sourceConversationName: conversationStoreFor(target.workspaceId).get(target.workspaceId, target.conversationId)?.name,
+    messageCount: snapshot.messages.length,
+    sourceFrom: snapshot.messages[0]?.createdAt,
+    sourceTo: snapshot.messages.at(-1)?.createdAt,
+    segmentCount: sessions.agents.reduce((sum, agent) => sum + agent.segmentCount, 0),
+    switchCount: sessions.agents.reduce((sum, agent) => sum + agent.switchCount, 0),
+    problemItems: problems.items.map((item) => ({ id: item.id, kind: item.kind, text: item.text, createdAt: item.createdAt })),
+    recentMessages: snapshot.messages,
+  });
+  return { snapshot, material };
+}
+
+/**
+ * 启动恢复：交接操作若停在 entry_written/verified，先回读新会话的入口
+ * 消息核对（id + 内容 hash + 检查点标识），对得上才补写 handoff.json 并
+ * 标 done；对不上或会话已建未写入口的保持原状态，留待下次交接请求续步。
+ */
+function reconcileHandoffOperationsAtStartup(): void {
+  try {
+    for (const workspace of workspaceStore.list()) {
+      const store = conversationStoreFor(workspace.id);
+      for (const conversation of store.list(workspace.id)) {
+        const conversationDir = workspaceStore.channelsDir(workspace.id, conversation.id);
+        let names: string[] = [];
+        try {
+          names = fs.readdirSync(path.join(conversationDir, "archives"), { withFileTypes: true })
+            .filter((entry) => entry.isDirectory() && entry.name.startsWith("ckpt-"))
+            .map((entry) => entry.name);
+        } catch {
+          continue;
+        }
+        for (const name of names) {
+          const packageDir = path.join(conversationDir, "archives", name);
+          for (const op of readOperations(packageDir)) {
+            if (op.state !== "entry_written" && op.state !== "verified") continue;
+            if (!op.newConversationId || !op.entryMessageId || !op.entryTextSha256) continue;
+            try {
+              const history = new MessageStore(
+                path.join(workspaceStore.channelsDir(workspace.id, op.newConversationId), "messages.json"),
+                { historyRead: true },
+              );
+              const found = history.historySince(0).find((message) => message.id === op.entryMessageId);
+              if (found && sha256Hex(found.content) === op.entryTextSha256 && found.content.includes(op.checkpointId)) {
+                writeHandoffRecord(packageDir, {
+                  checkpointId: op.checkpointId,
+                  operationId: op.operationId,
+                  newConversationId: op.newConversationId,
+                  entryMessageId: op.entryMessageId,
+                  completedAt: new Date().toISOString(),
+                });
+                writeOperation(packageDir, { ...op, state: "done" });
+              }
+            } catch { /* 单个操作恢复失败不阻断启动 */ }
+          }
+        }
+      }
+    }
+  } catch { /* 恢复扫描失败不阻断启动 */ }
+}
+
 // --- Initialize ---
 migrateChannelLayer();
 initActiveContext();
+reconcileHandoffOperationsAtStartup();
 runHistoryCleanup();
 runAttachmentDraftCleanup();
 
@@ -926,6 +1095,7 @@ const server = http.createServer(async (req, res) => {
       }
       const includeProblems = url.searchParams.get("problems") !== "0";
       const includeSessions = url.searchParams.get("sessions") !== "0";
+      const includeCheckpoints = url.searchParams.get("checkpoints") !== "0";
       const ctx = contextForTarget(target);
       if (!ctx) {
         sendJson(res, 200, {
@@ -937,6 +1107,7 @@ const server = http.createServer(async (req, res) => {
           edges: [],
           problems: { enabled: includeProblems, items: [], clusters: [], totalItems: 0, truncated: false, dataIncomplete: false },
           sessions: { enabled: includeSessions, agents: [], hasUnknownIntervals: false },
+          checkpoints: checkpointsBlockFor(target.workspaceId, convId, includeCheckpoints),
         });
         return;
       }
@@ -961,7 +1132,157 @@ const server = http.createServer(async (req, res) => {
         agentRuntimes,
         includeProblems,
         includeSessions,
+        checkpoints: checkpointsBlockFor(target.workspaceId, convId, includeCheckpoints),
       }));
+      return;
+    }
+
+
+    // 检查点（第二步 v1）：生成 / 删除 / 交接预览 / 交接。写端点组有独立
+    // 开关，关闭时服务端直接拒绝写操作；只读聚合走 graph DTO 的旁路块。
+    if (url.pathname.startsWith("/api/conversations/") && url.pathname.includes("/checkpoints")) {
+      const parts = url.pathname.split("/");
+      const convId = parts[3];
+      const checkpointId = parts[5];
+      const action = parts[6];
+      const target = convId ? resolveTarget(url) : null;
+      if (!convId || !target || target.conversationId !== convId) {
+        sendJson(res, 409, { ok: false, message: "workspaceId and conversationId are required." });
+        return;
+      }
+      if (req.method !== "GET" && !checkpointsWriteEnabled()) {
+        sendJson(res, 403, { ok: false, code: "checkpoints-disabled", message: "检查点写操作已关闭（ORBIT_CHECKPOINTS=0）。" });
+        return;
+      }
+      const conversationDir = workspaceStore.channelsDir(target.workspaceId, convId);
+      try {
+        if (req.method === "POST" && parts.length === 5) {
+          const ctx = contextForTarget(target);
+          if (!ctx) { sendJson(res, 409, { ok: false, message: "Conversation is not available." }); return; }
+          const snapshot = readConversationSnapshot(conversationDir);
+          const { sessions, problems } = checkpointDerivations(target, ctx, snapshot);
+          const conversation = conversationStoreFor(target.workspaceId).get(target.workspaceId, convId);
+          if (!conversation) { sendJson(res, 404, { ok: false, message: "Conversation not found." }); return; }
+          const result = createCheckpoint({
+            conversationDir,
+            workspaceConversationsRoot: path.dirname(conversationDir),
+            snapshot,
+            sessions,
+            problems: stripProblemsText(problems),
+            conversation,
+            config: checkpointConfig,
+          });
+          sendJson(res, 200, { ok: true, created: result.created, checkpointId: result.checkpointId, contentKey: result.contentKey });
+          return;
+        }
+        if (req.method === "DELETE" && checkpointId && parts.length === 6) {
+          deleteCheckpoint(conversationDir, checkpointId);
+          sendJson(res, 200, { ok: true, checkpointId });
+          return;
+        }
+        if (req.method === "GET" && checkpointId && action === "handoff-preview" && parts.length === 7) {
+          const packageDir = checkpointDir(conversationDir, checkpointId);
+          const manifest = readManifest(packageDir);
+          if (!manifest) { sendJson(res, 404, { ok: false, message: "检查点不存在或已删除。" }); return; }
+          const ctx = contextForTarget(target);
+          if (!ctx) { sendJson(res, 409, { ok: false, message: "Conversation is not available." }); return; }
+          const { material } = handoffMaterialFor(target, ctx, conversationDir, manifest);
+          sendJson(res, 200, { ok: true, checkpointId, ...material });
+          return;
+        }
+        if (req.method === "POST" && checkpointId && action === "handoff" && parts.length === 7) {
+          const input = (await readJson(req)) as { excerptHash?: unknown };
+          const excerptHash = typeof input.excerptHash === "string" ? input.excerptHash : "";
+          if (!excerptHash) { sendJson(res, 400, { ok: false, message: "excerptHash is required." }); return; }
+          const packageDir = checkpointDir(conversationDir, checkpointId);
+          const manifest = readManifest(packageDir);
+          if (!manifest) { sendJson(res, 404, { ok: false, message: "检查点不存在或已删除。" }); return; }
+          const ctx = contextForTarget(target);
+          if (!ctx) { sendJson(res, 409, { ok: false, message: "Conversation is not available." }); return; }
+          const { material } = handoffMaterialFor(target, ctx, conversationDir, manifest);
+          if (material.excerptHash !== excerptHash) {
+            sendJson(res, 409, { ok: false, code: "excerpt-stale", message: "源会话在预览后发生变化，请重新预览并确认摘录。" });
+            return;
+          }
+          const outcome = await withCheckpointLock(`${target.workspaceId}:${convId}:${checkpointId}`, async () => {
+            const claim = claimHandoffOperation(packageDir, checkpointId);
+            let op = claim.operation;
+            if (op.state === "done") {
+              return { alreadyDone: true, operationId: op.operationId, newConversationId: op.newConversationId };
+            }
+            try {
+              if (!op.newConversationId) {
+                let newConversationId = claim.reusableConversationId;
+                if (newConversationId) {
+                  const existing = conversationStoreFor(target.workspaceId).get(target.workspaceId, newConversationId);
+                  const existingCtx = existing ? getOrCreateContext(target.workspaceId, newConversationId) : null;
+                  if (!existing || !existingCtx || existingCtx.messages.list().length > 0) newConversationId = undefined;
+                }
+                if (!newConversationId) {
+                  const source = conversationStoreFor(target.workspaceId).get(target.workspaceId, convId);
+                  const created = conversationStoreFor(target.workspaceId).create(
+                    target.workspaceId,
+                    conversationTitle(`交接：${source?.name ?? convId}`),
+                  );
+                  newConversationId = created.id;
+                  getOrCreateContext(target.workspaceId, newConversationId);
+                }
+                op = { ...op, newConversationId, state: "session_created", excerptHash };
+                writeOperation(packageDir, op);
+              }
+              const newCtx = getOrCreateContext(target.workspaceId, op.newConversationId!);
+              if (op.entryMessageId) {
+                const stored = newCtx.messages.get(op.entryMessageId);
+                if (!stored || sha256Hex(stored.content) !== op.entryTextSha256 || !stored.content.includes(checkpointId)) {
+                  if (op.state === "entry_written" || op.state === "verified") {
+                    op = { ...op, state: "failed", error: "entry-missing-or-mismatch" };
+                    writeOperation(packageDir, op);
+                    throw new CheckpointError("entry-missing", "交接入口消息缺失或内容不符，操作已置失败；请重新交接。");
+                  }
+                  op = { ...op, entryMessageId: undefined, entryTextSha256: undefined };
+                }
+              }
+              if (!op.entryMessageId) {
+                // 只导入上下文：直接经消息存储落盘，不经消息路由，不触发 agent 执行。
+                const storedMessage = newCtx.messages.append({ kind: "system", content: material.fullText });
+                op = { ...op, entryMessageId: storedMessage.id, entryTextSha256: sha256Hex(material.fullText), state: "entry_written" };
+                writeOperation(packageDir, op);
+              }
+              const verify = newCtx.messages.get(op.entryMessageId!);
+              if (!verify || sha256Hex(verify.content) !== op.entryTextSha256 || !verify.content.includes(checkpointId)) {
+                op = { ...op, state: "failed", error: "entry-verify-failed" };
+                writeOperation(packageDir, op);
+                throw new CheckpointError("entry-verify-failed", "交接入口消息回读校验失败。");
+              }
+              op = { ...op, state: "verified" };
+              writeOperation(packageDir, op);
+              writeHandoffRecord(packageDir, {
+                checkpointId,
+                operationId: op.operationId,
+                newConversationId: op.newConversationId!,
+                entryMessageId: op.entryMessageId!,
+                completedAt: new Date().toISOString(),
+              });
+              op = { ...op, state: "done" };
+              writeOperation(packageDir, op);
+              return { alreadyDone: false, operationId: op.operationId, newConversationId: op.newConversationId };
+            } catch (error) {
+              if (op.state !== "done" && op.state !== "failed") {
+                try {
+                  writeOperation(packageDir, { ...op, state: "failed", error: error instanceof Error ? error.message : String(error) });
+                } catch { /* 失败记录写不下时不掩盖原错误 */ }
+              }
+              throw error;
+            }
+          });
+          sendJson(res, 200, { ok: true, ...outcome });
+          return;
+        }
+      } catch (error) {
+        sendCheckpointError(res, error);
+        return;
+      }
+      sendJson(res, 404, { ok: false, message: "Unknown checkpoints route." });
       return;
     }
 

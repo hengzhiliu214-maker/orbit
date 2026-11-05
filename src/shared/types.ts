@@ -658,6 +658,7 @@ export type ConversationGraph = {
   edges: ConversationGraphEdge[];
   problems: ConversationGraphProblems;
   sessions: ConversationGraphSessions;
+  checkpoints: ConversationGraphCheckpoints;
 };
 
 export type MessageHistoryState = {
@@ -806,4 +807,37 @@ export type AppState = {
   agentModelStates: Record<AgentId, AgentModelStateSnapshot>;
   /** 各数字员工 runtime 会话的斜杠命令快照（issue #160），供输入框 "/" 菜单使用。 */
   agentCommands: Record<AgentId, AgentCommandsSnapshot>;
+};
+
+/** 检查点（第二步 v1，稳妥版）：只存索引与结构、不含消息正文；正文只在交接时经用户预览确认后即时摘录。 */
+export type ConversationCheckpointHandoffState = "in-progress" | "done" | "failed";
+
+export type ConversationGraphCheckpointItem = {
+  checkpointId: string;
+  status: "ready" | "deleted";
+  createdAt: string;
+  messageCount: number;
+  sourceFrom?: string;
+  sourceTo?: string;
+  contentKey: string;
+  sizeBytes: number;
+  handoffNewConversationId?: string;
+  handoffState?: ConversationCheckpointHandoffState;
+  /** 包损坏/不可读时只标自身，不拖垮 graph 其余部分。 */
+  degraded?: boolean;
+};
+
+/** 检查点只读聚合（可关闭、坏包隔离降级）；写操作走独立端点与独立开关（writeEnabled）。 */
+export type ConversationGraphCheckpoints = {
+  enabled: boolean;
+  degraded?: boolean;
+  writeEnabled: boolean;
+  items: ConversationGraphCheckpointItem[];
+  /** 本会话未删除的检查点数与占用字节。 */
+  count: number;
+  totalBytes: number;
+  /** 本工作区全部会话 archives 总字节。 */
+  workspaceTotalBytes: number;
+  maxPerConversation: number;
+  maxWorkspaceBytes: number;
 };

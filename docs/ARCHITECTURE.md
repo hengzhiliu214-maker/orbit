@@ -431,6 +431,10 @@ The conversation graph response includes an optional, independently degradable s
 
 Completed-task median duration excludes running, failed, and cancelled tasks. Cancelling an intermediate queued branch does not override a later successful outcome.
 
+## Conversation Checkpoints
+
+Manual checkpoints (anti-collapse archives) live under the conversation's own data directory at `conversations/<workspaceId>/<conversationId>/archives/ckpt-<timestamp>-<seq>/`. The stable policy stores indexes and structure only — a per-message index (ids, timestamps, run/session ids, char counts, content hashes), the session-status snapshot, the problem-board structure with text hashes instead of text, and the conversation record — plus a deterministic manifest. Message bodies are never copied into a package; the reuse key (`contentKey`) covers source shard hashes, the selection scope, and derivation/schema versions (not generation timestamps), so regenerating from unchanged source returns the existing package. Packages are capped per conversation and per workspace; deletion moves a package to `archives/.trash/` first. Handoff to a new conversation is an explicit, confirmed flow: the entry material (fact index plus a size-capped verbatim excerpt) is assembled from the live source at handoff time, previewed by the user, and written as a context-import message that never triggers agent execution and never inherits the old conversation's authorization. Handoff progress is persisted as an operation record inside the package before any side effect, so a crash mid-handoff resumes by verifying what already landed instead of duplicating it. Checkpoint writes sit behind their own server-side switch (`ORBIT_CHECKPOINTS=0` disables) and endpoint group; the read side is a degradable block in the conversation graph DTO.
+
 ## Future Extension Points
 
 - Add persistent SQLite storage behind `MessageStore` and transcript storage if shard files stop scaling.

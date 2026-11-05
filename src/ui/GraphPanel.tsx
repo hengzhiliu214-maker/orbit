@@ -19,6 +19,7 @@ import * as dagre from "@dagrejs/dagre";
 
 import type {
   ConversationGraph,
+  ConversationGraphCheckpoints,
   ConversationGraphNode,
   ConversationGraphNodeStatus,
   ConversationGraphNodeType,
@@ -471,6 +472,11 @@ function SessionBoard(props: {
   error: string | null;
   sessionsEnabled: boolean;
   onToggleSessions: (enabled: boolean) => void;
+  workspaceId: string;
+  conversationId: string;
+  checkpointsEnabled: boolean;
+  onToggleCheckpoints: (enabled: boolean) => void;
+  onGraphChanged: () => void;
 }) {
   const [budgetInput, setBudgetInput] = useState(() => {
     try {
@@ -496,8 +502,16 @@ function SessionBoard(props: {
   </>;
   if (!props.graph) return <div className="sessionBoard">{header}<div className="graphEmpty">{props.error ?? "加载中…"}</div></div>;
   const sessions = props.graph.sessions;
-  if (!sessions?.enabled) return <div className="sessionBoard">{header}<div className="graphEmpty">会话状态已关闭。</div></div>;
-  if (sessions.degraded) return <div className="sessionBoard">{header}<div className="graphEmpty">会话状态暂时不可用（统计已降级）。</div></div>;
+  const checkpointSection = <CheckpointSection
+    workspaceId={props.workspaceId}
+    conversationId={props.conversationId}
+    checkpoints={props.graph.checkpoints}
+    checkpointsEnabled={props.checkpointsEnabled}
+    onToggleCheckpoints={props.onToggleCheckpoints}
+    onChanged={props.onGraphChanged}
+  />;
+  if (!sessions?.enabled) return <div className="sessionBoard">{header}<div className="graphEmpty">会话状态已关闭。</div>{checkpointSection}</div>;
+  if (sessions.degraded) return <div className="sessionBoard">{header}<div className="graphEmpty">会话状态暂时不可用（统计已降级）。</div>{checkpointSection}</div>;
   return <div className="sessionBoard">{header}
     {sessions.agents.length === 0 ? <div className="graphEmpty">本会话还没有员工执行记录。</div> : sessions.agents.map((agent) => {
       const lastSegment = agent.blocks.filter((block) => block.type === "segment").at(-1);
@@ -519,7 +533,172 @@ function SessionBoard(props: {
           </div>)}</div>
       </section>;
     })}
+    {checkpointSection}
   </div>;
+}
+
+
+type HandoffPreviewData = {
+  ok: boolean;
+  fullText: string;
+  excerptHash: string;
+  excerptChars: number;
+  omitted: string[];
+};
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function CheckpointSection(props: {
+  workspaceId: string;
+  conversationId: string;
+  checkpoints: ConversationGraphCheckpoints | undefined;
+  checkpointsEnabled: boolean;
+  onToggleCheckpoints: (enabled: boolean) => void;
+  onChanged: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [errorText, setErrorText] = useState<string | null>(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [handoffFor, setHandoffFor] = useState<string | null>(null);
+  const [preview, setPreview] = useState<HandoffPreviewData | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const checkpoints = props.checkpoints;
+  const base = `/api/conversations/${encodeURIComponent(props.conversationId)}/checkpoints`;
+  const query = `workspaceId=${encodeURIComponent(props.workspaceId)}&conversationId=${encodeURIComponent(props.conversationId)}`;
+
+  const request = async (url: string, init?: RequestInit): Promise<Record<string, unknown>> => {
+    const response = await fetch(url, init);
+    const data = (await response.json().catch(() => ({}))) as { ok?: boolean; message?: string };
+    if (!response.ok || data.ok === false) throw new Error(data.message ?? `请求失败：${response.status}`);
+    return data as Record<string, unknown>;
+  };
+  const run = async (fn: () => Promise<void>) => {
+    setBusy(true);
+    setErrorText(null);
+    setNotice(null);
+    try {
+      await fn();
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const create = () => void run(async () => {
+    const data = await request(`${base}?${query}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    setNotice(data.created ? `检查点已生成：${String(data.checkpointId)}` : "内容未变化，已有相同检查点，直接复用。");
+    props.onChanged();
+  });
+  const remove = (checkpointId: string) => void run(async () => {
+    await request(`${base}/${encodeURIComponent(checkpointId)}?${query}`, { method: "DELETE" });
+    setConfirmDeleteId(null);
+    setNotice(`检查点 ${checkpointId} 已移入回收站（.trash，保留期后清除）。`);
+    props.onChanged();
+  });
+  const openHandoff = (checkpointId: string) => {
+    setHandoffFor(checkpointId);
+    setPreview(null);
+    setPreviewError(null);
+    void (async () => {
+      try {
+        const data = await request(`${base}/${encodeURIComponent(checkpointId)}/handoff-preview?${query}`);
+        setPreview(data as unknown as HandoffPreviewData);
+      } catch (error) {
+        setPreviewError(error instanceof Error ? error.message : String(error));
+      }
+    })();
+  };
+  const confirmHandoff = () => {
+    if (!handoffFor || !preview) return;
+    void run(async () => {
+      const data = await request(`${base}/${encodeURIComponent(handoffFor)}/handoff?${query}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ excerptHash: preview.excerptHash }),
+      });
+      setHandoffFor(null);
+      setPreview(null);
+      setNotice(data.alreadyDone ? "该检查点已交接过，未重复创建新会话。" : `交接完成，新会话：${String(data.newConversationId)}`);
+      props.onChanged();
+    });
+  };
+
+  const head = (
+    <div className="checkpointHead">
+      <strong>检查点（防崩存档）</strong>
+      <label className="problemToggle"><input type="checkbox" checked={props.checkpointsEnabled} onChange={(event) => props.onToggleCheckpoints(event.target.checked)} />启用</label>
+    </div>
+  );
+  if (!checkpoints || !checkpoints.enabled) {
+    return <section className="checkpointSection">{head}<div className="graphEmpty">检查点已关闭。</div></section>;
+  }
+  return <section className="checkpointSection">
+    {head}
+    <div className="checkpointUsage">
+      本会话 {checkpoints.count} 个 · {formatBytes(checkpoints.totalBytes)} · 工作区共 {formatBytes(checkpoints.workspaceTotalBytes)}（上限：每会话 {checkpoints.maxPerConversation} 个 · 工作区 {formatBytes(checkpoints.maxWorkspaceBytes)}）
+    </div>
+    <div className="checkpointNote">
+      稳妥版：检查点只存索引与结构，不含消息正文；正文只在交接时经你预览确认后即时摘录。
+      {checkpoints.writeEnabled ? null : " 当前写操作已由服务端关闭。"}
+      {checkpoints.degraded ? " 检查点数据暂时不可用（已降级）。" : null}
+    </div>
+    <div className="checkpointToolbar">
+      <button type="button" disabled={busy || !checkpoints.writeEnabled} onClick={create}>生成检查点</button>
+    </div>
+    {notice ? <div className="checkpointNotice">{notice}</div> : null}
+    {errorText ? <div className="checkpointError">{errorText}</div> : null}
+    {checkpoints.items.length === 0 ? <div className="graphEmpty">还没有检查点。</div> : checkpoints.items.map((item) => (
+      <div className="checkpointItem" key={`${item.checkpointId}:${item.status}`}>
+        <div className="checkpointItemMain">
+          <span className="checkpointId">{item.checkpointId}</span>
+          {item.status === "deleted" ? <span className="checkpointTag deleted">源已删除</span> : null}
+          {item.degraded ? <span className="checkpointTag">包损坏</span> : null}
+          {item.handoffState === "done" ? <span className="checkpointTag done">已交接 → {item.handoffNewConversationId}</span> : null}
+          {item.handoffState === "in-progress" ? <span className="checkpointTag">交接进行中</span> : null}
+          {item.handoffState === "failed" ? <span className="checkpointTag">交接失败，可重试</span> : null}
+          <span className="checkpointMeta">
+            {item.createdAt ? formatDateTime(item.createdAt) : ""} · 消息 {item.messageCount} 条
+            {item.sourceFrom ? ` · ${formatDateTime(item.sourceFrom)} ~ ${item.sourceTo ? formatDateTime(item.sourceTo) : ""}` : ""} · {formatBytes(item.sizeBytes)}
+          </span>
+        </div>
+        {item.status === "ready" && !item.degraded ? (
+          <div className="checkpointActions">
+            <button type="button" disabled={busy || !checkpoints.writeEnabled} onClick={() => openHandoff(item.checkpointId)}>交接</button>
+            {confirmDeleteId === item.checkpointId ? (
+              <button type="button" disabled={busy} onClick={() => remove(item.checkpointId)}>确认删除</button>
+            ) : (
+              <button type="button" disabled={busy || !checkpoints.writeEnabled} onClick={() => setConfirmDeleteId(item.checkpointId)}>删除</button>
+            )}
+          </div>
+        ) : null}
+      </div>
+    ))}
+    {handoffFor ? (
+      <div className="modalOverlay" onClick={() => { setHandoffFor(null); setPreview(null); }}>
+        <div className="handoffDialog" onClick={(event) => event.stopPropagation()}>
+          <div className="handoffDialogHead"><strong>交接到新会话</strong><span>{handoffFor}</span></div>
+          {previewError ? <div className="checkpointError">{previewError}</div> : !preview ? (
+            <div className="graphEmpty">正在组装入口材料…</div>
+          ) : <>
+            <div className="checkpointNote">
+              入口材料以「只导入上下文」方式写入新会话，不触发员工执行；新会话不继承旧会话授权。
+              摘录 {preview.excerptChars} 字{preview.omitted.length ? `；省略 ${preview.omitted.length} 项（见文末说明）` : ""}。
+            </div>
+            <pre className="handoffExcerpt">{preview.fullText}</pre>
+            <div className="handoffDialogActions">
+              <button type="button" onClick={() => { setHandoffFor(null); setPreview(null); }}>取消</button>
+              <button type="button" disabled={busy} onClick={confirmHandoff}>确认交接</button>
+            </div>
+          </>}
+        </div>
+      </div>
+    ) : null}
+  </section>;
 }
 
 export function GraphPanel(props: {
@@ -538,6 +717,7 @@ export function GraphPanel(props: {
   const [activeTab, setActiveTab] = useState<"tree" | "problems" | "sessions">("tree");
   const [problemsEnabled, setProblemsEnabled] = useState(true);
   const [sessionsEnabled, setSessionsEnabled] = useState(true);
+  const [checkpointsEnabled, setCheckpointsEnabled] = useState(true);
   const issueRef = useRef(false);
   const issueCallbackRef = useRef(props.onSessionsIssueChange);
   issueCallbackRef.current = props.onSessionsIssueChange;
@@ -550,6 +730,7 @@ export function GraphPanel(props: {
     const query = new URLSearchParams({ workspaceId: props.workspaceId, conversationId: props.conversationId });
     if (!problemsEnabled) query.set("problems", "0");
     if (!sessionsEnabled) query.set("sessions", "0");
+    if (!checkpointsEnabled) query.set("checkpoints", "0");
     const response = await fetch(
       `/api/conversations/${encodeURIComponent(props.conversationId)}/graph?${query.toString()}`,
       { signal },
@@ -567,7 +748,14 @@ export function GraphPanel(props: {
       }
       return current;
     });
-  }, [props.workspaceId, props.conversationId, problemsEnabled, sessionsEnabled]);
+  }, [props.workspaceId, props.conversationId, problemsEnabled, sessionsEnabled, checkpointsEnabled]);
+
+  const refreshGraph = useCallback(() => {
+    const controller = new AbortController();
+    fetchGraph(controller.signal).catch(() => {
+      // 操作后的刷新失败时保留上一份图，下一次实时事件会再试。
+    });
+  }, [fetchGraph]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -653,7 +841,7 @@ export function GraphPanel(props: {
           {graph?.sessions?.enabled && graph.sessions.hasUnknownIntervals ? <span className="graphTabWarn" title="存在未记录 sessionId 的未知区间">!</span> : null}
         </button>
       </div>
-      {activeTab === "sessions" ? <SessionBoard graph={graph} error={error} sessionsEnabled={sessionsEnabled} onToggleSessions={setSessionsEnabled} /> : null}
+      {activeTab === "sessions" ? <SessionBoard graph={graph} error={error} sessionsEnabled={sessionsEnabled} onToggleSessions={setSessionsEnabled} workspaceId={props.workspaceId} conversationId={props.conversationId} checkpointsEnabled={checkpointsEnabled} onToggleCheckpoints={setCheckpointsEnabled} onGraphChanged={refreshGraph} /> : null}
       {activeTab === "problems" ? (
         <ProblemBoard
           graph={graph}

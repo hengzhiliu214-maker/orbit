@@ -5,12 +5,14 @@ import type {
   ConversationGraphNode,
   ConversationGraphNodeStatus,
   ConversationGraphNodeType,
+  ConversationGraphCheckpoints,
   ConversationGraphRoot,
 } from "../shared/types.ts";
 import { INTERNAL_SUPERVISOR_ID } from "./agent-profiles.ts";
 import { assignmentPattern } from "./mention-router.ts";
 import { buildProblemBoard, emptyProblems } from "./conversation-problems.ts";
 import { buildConversationSessions, emptySessions } from "./conversation-sessions.ts";
+import { emptyCheckpoints } from "./conversation-checkpoints.ts";
 
 export type BuildConversationGraphOptions = {
   workspaceId: string;
@@ -23,6 +25,11 @@ export type BuildConversationGraphOptions = {
   includeProblems?: boolean;
   /** 会话状态纯派生开关，默认开启。 */
   includeSessions?: boolean;
+  /**
+   * 检查点只读聚合（服务端从 archives 目录算好后传入；本函数保持纯派生，
+   * 不读文件系统）。缺省时给关闭态空块，写入口在服务端独立端点。
+   */
+  checkpoints?: ConversationGraphCheckpoints;
 };
 
 /**
@@ -173,6 +180,7 @@ export function buildConversationGraph(options: BuildConversationGraphOptions): 
     edges,
     problems,
     sessions,
+    checkpoints: options.checkpoints ?? emptyCheckpoints(false, false),
   };
 }
 

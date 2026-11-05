@@ -7714,3 +7714,25 @@ button:active:not(:disabled) {
 .sessionOverBadge { color: var(--warning); }
 .sessionDataMark { color: var(--warning); font-size: 11px; }
 .graphTabWarn { background: var(--warning); color: var(--bg-surface); border-radius: 999px; font-size: 11px; line-height: 1.5; padding: 0 6px; }
+
+/* 检查点（会话状态页签内，防崩存档第二步） */
+.checkpointSection { border: 1px solid var(--border); border-radius: 10px; background: var(--bg-surface); overflow: hidden; }
+.checkpointHead { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 7px 10px; background: var(--bg-muted); color: var(--text-primary); font-size: 12px; }
+.checkpointUsage { padding: 7px 10px 0; color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
+.checkpointNote { padding: 4px 10px 0; color: var(--text-muted); font-size: 11.5px; line-height: 1.55; }
+.checkpointToolbar { padding: 8px 10px 2px; }
+.checkpointNotice { margin: 6px 10px 0; padding: 6px 8px; border-radius: 6px; background: var(--bg-muted); color: var(--text-secondary); font-size: 12px; overflow-wrap: anywhere; }
+.checkpointError { margin: 6px 10px 0; padding: 6px 8px; border-radius: 6px; background: var(--bg-muted); color: var(--danger, #c0392b); font-size: 12px; overflow-wrap: anywhere; }
+.checkpointItem { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; padding: 7px 10px; border-top: 1px solid var(--border-light); }
+.checkpointItemMain { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.checkpointId { font-family: var(--font-mono, monospace); font-size: 11.5px; color: var(--text-primary); overflow-wrap: anywhere; }
+.checkpointMeta { color: var(--text-secondary); font-size: 12px; line-height: 1.6; flex-basis: 100%; }
+.checkpointTag { font-size: 11px; padding: 1px 6px; border-radius: 999px; background: var(--bg-muted); color: var(--text-secondary); border: 1px solid var(--border-light); }
+.checkpointTag.done { color: var(--success, #1e7d46); }
+.checkpointTag.deleted { color: var(--warning); }
+.checkpointActions { display: flex; gap: 6px; flex-shrink: 0; }
+.handoffDialog { background: var(--bg-surface); border: 1px solid var(--border); border-radius: 12px; max-width: 720px; width: calc(100vw - 48px); max-height: calc(100vh - 96px); display: flex; flex-direction: column; gap: 8px; padding: 14px; }
+.handoffDialogHead { display: flex; align-items: baseline; gap: 10px; color: var(--text-primary); font-size: 13px; }
+.handoffDialogHead span { font-family: var(--font-mono, monospace); font-size: 11.5px; color: var(--text-muted); overflow-wrap: anywhere; }
+.handoffExcerpt { flex: 1; min-height: 0; overflow: auto; margin: 0; padding: 10px; border: 1px solid var(--border-light); border-radius: 8px; background: var(--bg-muted); color: var(--text-secondary); font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+.handoffDialogActions { display: flex; justify-content: flex-end; gap: 8px; }
