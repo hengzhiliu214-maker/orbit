@@ -867,10 +867,16 @@ function attachCompactionToGraph(graph: ConversationGraph, workspaceId: string, 
     const { coverage, byAgent } = buildCompactionDerivation({ read, agents: graph.sessions.agents });
     graph.sessions.compactionCoverage = coverage;
     for (const agent of graph.sessions.agents) {
-      if (agent.runtime !== COMPACTION_PILOT_RUNTIME) continue;
-      const view = byAgent.get(agent.agentId)
-        ?? (coverage.intervals.length > 0 ? { markerSegmentCount: 0, unassignedSegmentCount: 0, segments: [] } : undefined);
-      if (view) agent.compaction = view;
+      // 事件文件里只会有试点引擎的标记（唯一生产者），按 agentId 挂载即可，
+      // 不依赖 DTO 里 runtime 是否在场（历史员工在冷进程下可能没有 runtime）。
+      const view = byAgent.get(agent.agentId);
+      if (view) {
+        agent.compaction = view;
+        continue;
+      }
+      if (agent.runtime === COMPACTION_PILOT_RUNTIME && coverage.intervals.length > 0) {
+        agent.compaction = { markerSegmentCount: 0, unassignedSegmentCount: 0, segments: [] };
+      }
     }
   } catch { /* 派生失败只缺省 */ }
 }

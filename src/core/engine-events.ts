@@ -201,7 +201,9 @@ export function buildCompactionDerivation(args: {
     retentionDays,
   };
 
-  const drafts = groupMarkerSegments(retained);
+  // 试点口径：只统计试点引擎（CodeBuddy）的标记；同文件里其它引擎的事件
+  // （未来接入）不并入本视图。
+  const drafts = groupMarkerSegments(retained.filter((event) => event.runtime === COMPACTION_PILOT_RUNTIME));
   const byAgent = new Map<string, ConversationAgentCompaction>();
   for (const draft of drafts) {
     const agent = args.agents.find((entry) => entry.agentId === draft.agentId);

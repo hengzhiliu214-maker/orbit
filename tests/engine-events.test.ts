@@ -248,3 +248,17 @@ test("活体链路：标记回调抛错不影响运行结果", async () => {
   });
   assert.equal(await handle.result, "OK");
 });
+
+test("派生：非试点引擎的标记不并入试点视图", () => {
+  const agents = sessionsFixture();
+  const events: EngineEvent[] = [
+    marker("2026-11-05T10:02:00.000Z", { runtime: "codex" }),
+    marker("2026-11-05T10:03:00.000Z"),
+  ];
+  const { byAgent } = buildCompactionDerivation({
+    read: { exists: true, events, badLines: 0, degraded: false },
+    agents,
+    now: new Date("2026-11-05T12:00:00.000Z"),
+  });
+  assert.equal(byAgent.get("cb")?.markerSegmentCount, 1);
+});
