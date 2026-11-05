@@ -10,6 +10,37 @@ import { disposeAcpConnectionPool, probeAcpModelState } from "../core/acp-runtim
 import { defaultAcpRunnerRegistry } from "../core/acp-runner-registry.ts";
 import { AGENT_TEAM_TEMPLATES, AgentConfigStore, validateAgentConfigs } from "../core/agent-config-store.ts";
 import { AgentModelStateStore, supervisorStorageKey } from "../core/agent-model-state-store.ts";
+import { findStaleSnapshotPreferenceOverwrite } from "../core/agent-model-guard.ts";
+import { buildConversationGraph } from "../core/conversation-graph.ts";
+import {
+  assembleHandoffMaterial,
+  checkpointConfigFromEnv,
+  checkpointDir,
+  checkpointsWriteEnabled,
+  claimHandoffOperation,
+  createCheckpoint,
+  deleteCheckpoint,
+  emptyCheckpoints,
+  readConversationSnapshot,
+  readManifest,
+  readOperations,
+  sha256Hex,
+  stripProblemsText,
+  summarizeCheckpoints,
+  writeHandoffRecord,
+  writeOperation,
+  CheckpointError,
+  type ConversationSnapshot,
+  type CheckpointManifest,
+} from "../core/conversation-checkpoints.ts";
+import {
+  appendEngineEvent,
+  buildCompactionDerivation,
+  compactionCaptureEnabled,
+  COMPACTION_PILOT_RUNTIME,
+  ENGINE_EVENTS_SCHEMA_VERSION,
+  readEngineEvents,
+} from "../core/engine-events.ts";
 import { probeAllRuntimes, runtimeKindToCliKey, type RuntimeProbeResult } from "../core/runtime-probe.ts";
 import type { AgentConfig } from "../core/agent-config-store.ts";
 import { WorkspaceConfigStore } from "../core/workspace-config-store.ts";
@@ -25,7 +56,7 @@ import { initialAgentConfigsForWorkspacePreset } from "../core/workspace-agent-p
 import { getWorkspacePresets } from "../core/workspace-presets.ts";
 import { migrateChannelLayer } from "../core/migrate-channel-layer.ts";
 import { cleanupHistory } from "../core/history-retention.ts";
-import type { AgentCommandsSnapshot, AgentConfigWithModelState, AgentModelProbeResponse, AgentModelProbeState, ApprovalMode, Conversation, ConversationInfo, ElicitationResponse, InteractionMode, MessagePage, PermissionDecision, RunningSummary, SupervisorConfig, WorkspaceInfo, AgentId } from "../shared/types.ts";
+import type { AgentCommandsSnapshot, AgentConfigWithModelState, AgentModelProbeResponse, AgentModelProbeState, AgentModelStateSnapshot, ApprovalMode, Conversation, ConversationGraph, ConversationGraphCheckpoints, ConversationGraphProblems, ConversationGraphSessions, ConversationInfo, ElicitationResponse, InteractionMode, MessagePage, PermissionDecision, RunningSummary, SupervisorConfig, WorkspaceInfo, AgentId, ChatMessage } from "../shared/types.ts";
 import { isAgentRuntimeKind, isInteractionMode } from "../shared/types.ts";
 import { ATTACHMENT_LIMITS } from "../shared/types.ts";
 import { AttachmentStore } from "../core/attachment-store.ts";
@@ -33,6 +64,7 @@ import { buildAttachmentHeaders } from "./attachment-response.ts";
 import { canSendMessage } from "../shared/message-validation.ts";
 import { resolveSlashSendTarget } from "../core/native-commands.ts";
 import { ConversationContext } from "./conversation-context.ts";
+import { DefaultAgentOperationRegistry } from "./default-agent-operations.ts";
 import { probeAgentCommands } from "./command-probe.ts";
 import { findPortOwners, isOrbitPortOwner, stopPortOwner } from "./port-recovery.ts";
 import { readJson, RequestBodyTooLargeError } from "./read-json.ts";
@@ -77,6 +109,8 @@ const execFileAsync = promisify(execFile);
 // --- Shared singletons ---
 const eventBus = new EventBus();
 const sseHub = new SseHub();
+/** 默认接收人变更的操作登记（Dot 0096 终结屏障）：按会话串行并记录终结状态。 */
+const defaultAgentOperations = new DefaultAgentOperationRegistry();
 const workspaceStore = new WorkspaceStore();
 const configStore = new AgentConfigStore();
 const agentModelStateStore = new AgentModelStateStore();
@@ -116,6 +150,30 @@ async function probeRuntimes(): Promise<void> {
   }
 }
 
+// 模型探针在飞去重：同一工作区同一运行时的并发请求共享一次真实探测。
+// 昂贵的是 app-server 冷启动与首个 session/new（实测热态 3–6s、冷态 14–20s），
+// 重复并发只会互相拖慢。只共享探测本身；每个调用方仍按自己的目标与存储键
+// 回写快照，currentValueSource 与会话优先等既有合同不变。
+const modelProbeInFlight = new Map<string, Promise<AgentModelStateSnapshot | null>>();
+
+function sharedModelProbe(
+  workspaceId: string,
+  definition: Parameters<typeof probeAcpModelState>[0],
+  agentId: string,
+  cwd: string,
+): Promise<AgentModelStateSnapshot | null> {
+  const key = `${workspaceId}\n${definition.kind}`;
+  const inFlight = modelProbeInFlight.get(key);
+  if (inFlight) return inFlight;
+  const promise = probeAcpModelState(definition, { agentId, cwd });
+  modelProbeInFlight.set(key, promise);
+  const cleanup = () => {
+    if (modelProbeInFlight.get(key) === promise) modelProbeInFlight.delete(key);
+  };
+  promise.then(cleanup, cleanup);
+  return promise;
+}
+
 async function probeConfiguredAgentModels(
   force = false,
   runtimeFilter?: AgentConfig["runtime"],
@@ -132,6 +190,19 @@ async function probeConfiguredAgentModels(
   const targetsByRuntime = new Map<AgentConfig["runtime"], Array<Pick<AgentConfig, "id" | "runtime">>>();
   if (runtimeFilter && targetAgentId) {
     targetsByRuntime.set(runtimeFilter, [{ id: targetAgentId, runtime: runtimeFilter }]);
+    if (!force) {
+      // 定点非强制（监工面板打开等）且已有同运行时快照：先返回快照、后台刷新
+      // （stale-while-revalidate）。冷探针实测 3–20s，让界面干等没有收益；
+      // 刷新完成后经既有 SSE agent.model_state 回推新快照，updatedAt 仍以真实
+      // 探针完成时刻为准，不做假刷新。无快照时仍同步探测（无旧数据可先行展示）。
+      const storageKey = targetAgentId === INTERNAL_SUPERVISOR_ID && targetConversationId !== undefined
+        ? supervisorStorageKey(targetConversationId)
+        : targetAgentId;
+      if (existing[storageKey]?.runtimeKind === runtimeFilter) {
+        void executeModelProbes(workspaceId, workspace, targetsByRuntime, targetConversationId).catch(() => {});
+        return;
+      }
+    }
   } else {
     for (const config of configStore.load(workspaceId)) {
       if (runtimeFilter && config.runtime !== runtimeFilter) continue;
@@ -144,6 +215,16 @@ async function probeConfiguredAgentModels(
     }
   }
 
+  await executeModelProbes(workspaceId, workspace, targetsByRuntime, targetConversationId);
+}
+
+async function executeModelProbes(
+  workspaceId: string,
+  workspace: Pick<WorkspaceInfo, "path">,
+  targetsByRuntime: Map<AgentConfig["runtime"], Array<Pick<AgentConfig, "id" | "runtime">>>,
+  targetConversationId?: string,
+): Promise<void> {
+  const existing = agentModelStateStore.load(workspaceId);
   await Promise.all([...targetsByRuntime.entries()].map(async ([runtimeKind, targets]) => {
     const registration = defaultAcpRunnerRegistry.get(runtimeKind);
     if (!registration) {
@@ -157,10 +238,7 @@ async function probeConfiguredAgentModels(
     setModelProbeState(workspaceId, runtimeKind, { runtimeKind, status: "loading" });
     try {
       const first = targets[0]!;
-      const snapshot = await probeAcpModelState(registration.definition, {
-        agentId: first.id,
-        cwd: workspace.path,
-      });
+      const snapshot = await sharedModelProbe(workspaceId, registration.definition, first.id, workspace.path);
       if (!snapshot) {
         setModelProbeState(workspaceId, runtimeKind, {
           runtimeKind,
@@ -182,11 +260,26 @@ async function probeConfiguredAgentModels(
         const storageKey = isSupervisor ? supervisorStorageKey(targetConversationId!) : target.id;
         const previous = existing[storageKey];
         const hasSessionValue = previous?.runtimeKind === runtimeKind && previous.currentValueSource === "session";
+        // 探针只是预览（Dot 0055 合同）：已有会话确认状态时，探针写回不得
+        // 覆盖会话已确认的思考强度当前值，也不得把变体快照降级回基础
+        // 模型形态——两处都与 currentValue 一样以会话值为准（复核 P1/P2）。
+        const reasoning = hasSessionValue && previous.reasoning && snapshot.reasoning?.configId === previous.reasoning.configId
+          ? { ...snapshot.reasoning, currentValue: previous.reasoning.currentValue, currentValueSource: "session" as const }
+          : hasSessionValue && previous.reasoning && !snapshot.reasoning
+            ? previous.reasoning
+            : snapshot.reasoning;
+        const keepVariant = hasSessionValue &&
+          previous.modelApplyPath === "session_model" &&
+          snapshot.modelApplyPath !== "session_model";
         const targetSnapshot = {
           ...snapshot,
           agentId: target.id,
           currentValue: hasSessionValue ? previous.currentValue : undefined,
           currentValueSource: hasSessionValue ? "session" as const : "probe" as const,
+          ...(reasoning ? { reasoning } : {}),
+          ...(keepVariant
+            ? { choices: previous.choices, configId: previous.configId, modelApplyPath: "session_model" as const }
+            : {}),
         };
         agentModelStateStore.update(workspaceId, targetSnapshot, storageKey);
         sseHub.publish({
@@ -407,6 +500,7 @@ function getOrCreateContext(workspaceId: string, conversationId: string): Conver
   evictIfNeeded();
   const ctx = createContext(workspaceId, conversationId);
   contextMap.set(key, ctx);
+  noteCompactionCoverageStart(workspaceId, conversationId);
   touchLru(key);
   return ctx;
 }
@@ -516,8 +610,13 @@ function createContext(workspaceId: string, conversationId: string): Conversatio
         if (workspaceId === activeWorkspaceId && conversationId === activeConversationId) {
           activeConversation = toActiveConversation(updated);
         }
+        return true;
       } catch {
-        // 持久化失败不阻断路由流程；模式仍在本会话上下文中生效
+        // 持久化失败不阻断路由流程；模式仍在本会话上下文中生效。
+        // 返回 false 供显式设置默认接收人的路径回滚内存并报错（Dot
+        // 0096：此前静默吞掉落盘失败，会让内存已改、磁盘未改而响应
+        // 仍报成功）；其余调用方忽略返回值，行为不变。
+        return false;
       }
     },
   });
@@ -610,6 +709,8 @@ function switchWorkspace(workspaceId: string): void {
   activeConversation = EMPTY_CONVERSATION;
   saveLastActive(activeWorkspaceId, activeConversationId);
 
+  // 切到新工作区后后台补齐缺失的模型快照，面板打开时不必冷等（非强制语义）。
+  void probeConfiguredAgentModels(false, undefined, undefined, workspaceId).catch(() => {});
 }
 
 function refreshEnabledAgentsForWorkspace(workspaceId: string, configs: AgentConfig[]): void {
@@ -694,9 +795,228 @@ function currentAgentStates() {
     }));
 }
 
+
+// --- 检查点（第二步 v1）：独立端点组 + 独立开关；只读聚合经 graph DTO 旁路。 ---
+
+const checkpointConfig = checkpointConfigFromEnv();
+const handoffLocks = new Map<string, Promise<void>>();
+
+async function withCheckpointLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const previous = handoffLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  handoffLocks.set(key, previous.then(() => current));
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
+/**
+ * 压缩标记捕获的覆盖起点（第三步试点）：捕获开启时，每个会话在本进程内
+ * 首次被触及时记一条 coverage_start，派生层据此给出覆盖区间。落盘失败只
+ * 影响覆盖记录，绝不阻断上下文创建。
+ */
+const compactionCoverageStarted = new Set<string>();
+function noteCompactionCoverageStart(workspaceId: string, conversationId: string): void {
+  if (!compactionCaptureEnabled()) return;
+  const key = `${workspaceId}:${conversationId}`;
+  if (compactionCoverageStarted.has(key)) return;
+  compactionCoverageStarted.add(key);
+  try {
+    appendEngineEvent(workspaceStore.channelsDir(workspaceId, conversationId), {
+      kind: "coverage_start",
+      runtime: COMPACTION_PILOT_RUNTIME,
+      observedAt: new Date().toISOString(),
+      schemaVersion: ENGINE_EVENTS_SCHEMA_VERSION,
+    });
+  } catch { /* 旁路落盘失败不伤主链 */ }
+}
+
+/** 已观测压缩标记的落盘：AgentSession 经事件总线发来元数据，服务端在此落旁路文件。 */
+eventBus.subscribe((event) => {
+  if (event.type !== "run.compactionMarker") return;
+  if (!compactionCaptureEnabled()) return;
+  if (!event.workspaceId) return;
+  try {
+    appendEngineEvent(workspaceStore.channelsDir(event.workspaceId, event.conversationId), {
+      kind: "compaction_marker",
+      runtime: COMPACTION_PILOT_RUNTIME,
+      agentId: event.agentId,
+      runId: event.runId,
+      sessionId: event.sessionId,
+      ...(event.messageId ? { messageId: event.messageId } : {}),
+      observedAt: new Date().toISOString(),
+      schemaVersion: ENGINE_EVENTS_SCHEMA_VERSION,
+    });
+  } catch { /* 旁路落盘失败只置覆盖降级，绝不伤 run */ }
+});
+
+/**
+ * 把「已观测压缩标记」派生并入会话状态 DTO（第三步试点）。捕获关闭、会话
+ * 状态关闭或从未产生事件文件时不挂任何字段——DTO 与试点前逐字段一致。
+ * 派生失败只缺省，不拖垮 graph。
+ */
+function attachCompactionToGraph(graph: ConversationGraph, workspaceId: string, conversationId: string): void {
+  if (!graph.sessions.enabled || !compactionCaptureEnabled()) return;
+  try {
+    const read = readEngineEvents(workspaceStore.channelsDir(workspaceId, conversationId));
+    if (!read.exists) return;
+    const { coverage, byAgent } = buildCompactionDerivation({ read, agents: graph.sessions.agents });
+    graph.sessions.compactionCoverage = coverage;
+    for (const agent of graph.sessions.agents) {
+      if (agent.runtime !== COMPACTION_PILOT_RUNTIME) continue;
+      const view = byAgent.get(agent.agentId)
+        ?? (coverage.intervals.length > 0 ? { markerSegmentCount: 0, unassignedSegmentCount: 0, segments: [] } : undefined);
+      if (view) agent.compaction = view;
+    }
+  } catch { /* 派生失败只缺省 */ }
+}
+
+function checkpointsBlockFor(workspaceId: string, conversationId: string, enabled: boolean): ConversationGraphCheckpoints {
+  const writeEnabled = checkpointsWriteEnabled();
+  if (!enabled) return emptyCheckpoints(false, writeEnabled, false, checkpointConfig);
+  try {
+    const conversationDir = workspaceStore.channelsDir(workspaceId, conversationId);
+    return summarizeCheckpoints({
+      conversationDir,
+      workspaceConversationsRoot: path.dirname(conversationDir),
+      writeEnabled,
+      config: checkpointConfig,
+    });
+  } catch {
+    return emptyCheckpoints(true, writeEnabled, true, checkpointConfig);
+  }
+}
+
+function sendCheckpointError(res: http.ServerResponse, error: unknown): void {
+  if (error instanceof CheckpointError) {
+    const status = error.code === "cap-count" || error.code === "cap-bytes" || error.code === "snapshot-changed" || error.code === "excerpt-stale"
+      ? 409
+      : error.code === "not-found" || error.code === "snapshot-missing"
+        ? 404
+        : error.code === "invalid-id"
+          ? 400
+          : 422;
+    sendJson(res, status, { ok: false, code: error.code, message: error.message });
+    return;
+  }
+  sendJson(res, 500, { ok: false, message: error instanceof Error ? error.message : String(error) });
+}
+
+/** 以同一份落盘快照派生第一步会话状态与问题台（与 graph DTO 同一实现）。 */
+function checkpointDerivations(
+  target: RequestTarget,
+  ctx: ConversationContext,
+  snapshot: ConversationSnapshot,
+): { sessions: ConversationGraphSessions; problems: ConversationGraphProblems } {
+  const agentLabels = new Map<AgentId, string>();
+  const agentRuntimes = new Map<AgentId, string>();
+  for (const agentState of ctx.agents.states()) {
+    agentLabels.set(agentState.id, agentState.label);
+    agentRuntimes.set(agentState.id, agentState.runtime);
+  }
+  const graph = buildConversationGraph({
+    workspaceId: target.workspaceId,
+    conversationId: target.conversationId,
+    messages: snapshot.messages,
+    agentLabels,
+    agentRuntimes,
+    includeProblems: true,
+    includeSessions: true,
+  });
+  return { sessions: graph.sessions, problems: graph.problems };
+}
+
+function handoffMaterialFor(
+  target: RequestTarget,
+  ctx: ConversationContext,
+  conversationDir: string,
+  manifest: CheckpointManifest,
+) {
+  const snapshot = readConversationSnapshot(conversationDir);
+  const { sessions, problems } = checkpointDerivations(target, ctx, snapshot);
+  const material = assembleHandoffMaterial({
+    checkpointId: manifest.checkpointId,
+    checkpointCreatedAt: manifest.createdAt,
+    contentKey: manifest.contentKey,
+    sourceConversationId: target.conversationId,
+    sourceConversationName: conversationStoreFor(target.workspaceId).get(target.workspaceId, target.conversationId)?.name,
+    messageCount: snapshot.messages.length,
+    sourceFrom: snapshot.messages[0]?.createdAt,
+    sourceTo: snapshot.messages.at(-1)?.createdAt,
+    segmentCount: sessions.agents.reduce((sum, agent) => sum + agent.segmentCount, 0),
+    switchCount: sessions.agents.reduce((sum, agent) => sum + agent.switchCount, 0),
+    problemItems: problems.items.map((item) => ({ id: item.id, kind: item.kind, text: item.text, createdAt: item.createdAt })),
+    recentMessages: snapshot.messages,
+  });
+  return { snapshot, material };
+}
+
+/**
+ * 启动恢复：交接操作若停在 entry_written/verified，先回读新会话的入口
+ * 消息核对（id + 内容 hash + 检查点标识），对得上才补写 handoff.json 并
+ * 标 done；对不上或会话已建未写入口的保持原状态，留待下次交接请求续步。
+ */
+function reconcileHandoffOperationsAtStartup(): void {
+  try {
+    for (const workspace of workspaceStore.list()) {
+      const store = conversationStoreFor(workspace.id);
+      for (const conversation of store.list(workspace.id)) {
+        const conversationDir = workspaceStore.channelsDir(workspace.id, conversation.id);
+        let names: string[] = [];
+        try {
+          names = fs.readdirSync(path.join(conversationDir, "archives"), { withFileTypes: true })
+            .filter((entry) => entry.isDirectory() && entry.name.startsWith("ckpt-"))
+            .map((entry) => entry.name);
+        } catch {
+          continue;
+        }
+        for (const name of names) {
+          const packageDir = path.join(conversationDir, "archives", name);
+          for (const op of readOperations(packageDir)) {
+            if (op.state !== "entry_written" && op.state !== "verified") continue;
+            if (!op.newConversationId || !op.entryMessageId || !op.entryTextSha256) continue;
+            try {
+              const history = new MessageStore(
+                path.join(workspaceStore.channelsDir(workspace.id, op.newConversationId), "messages.json"),
+                { historyRead: true },
+              );
+              const found = history.historySince(0).find((message) => message.id === op.entryMessageId);
+              if (found && sha256Hex(found.content) === op.entryTextSha256 && found.content.includes(op.checkpointId)) {
+                writeHandoffRecord(packageDir, {
+                  checkpointId: op.checkpointId,
+                  operationId: op.operationId,
+                  newConversationId: op.newConversationId,
+                  entryMessageId: op.entryMessageId,
+                  completedAt: new Date().toISOString(),
+                });
+                writeOperation(packageDir, { ...op, state: "done" });
+              }
+            } catch { /* 单个操作恢复失败不阻断启动 */ }
+          }
+        }
+      }
+    }
+  } catch { /* 恢复扫描失败不阻断启动 */ }
+}
+
 // --- Initialize ---
 migrateChannelLayer();
 initActiveContext();
+reconcileHandoffOperationsAtStartup();
+// 第三步试点：捕获开启时，为既有会话补记压缩标记覆盖起点（每进程每会话一次）。
+if (compactionCaptureEnabled()) {
+  try {
+    for (const workspace of workspaceStore.list()) {
+      for (const conversation of conversationStoreFor(workspace.id).list(workspace.id)) {
+        noteCompactionCoverageStart(workspace.id, conversation.id);
+      }
+    }
+  } catch { /* 覆盖起点补记失败不阻断启动 */ }
+}
 runHistoryCleanup();
 runAttachmentDraftCleanup();
 
@@ -709,14 +1029,14 @@ runAttachmentDraftCleanup();
 function parseSupervisorConfig(input: { runtime?: unknown; model?: unknown }):
   { config: SupervisorConfig } | { error: string } {
   if (!isAgentRuntimeKind(input.runtime)) {
-    return { error: "监工运行时必须是 claude-code、codex 或 codebuddy。" };
+    return { error: "监工运行时必须是 claude-code、codex、codebuddy、dsh 或 workbuddy。" };
   }
   const runtime = input.runtime;
   if (input.model === undefined || input.model === null) return { config: { runtime } };
   if (typeof input.model !== "object" || Array.isArray(input.model)) {
     return { error: "监工模型配置格式不正确。" };
   }
-  const model = input.model as { preferredModelId?: unknown; runtimeKind?: unknown };
+  const model = input.model as { preferredModelId?: unknown; preferredReasoningValue?: unknown; runtimeKind?: unknown };
   if (model.runtimeKind !== undefined && !isAgentRuntimeKind(model.runtimeKind)) {
     return { error: "监工模型配置格式不正确。" };
   }
@@ -725,17 +1045,32 @@ function parseSupervisorConfig(input: { runtime?: unknown; model?: unknown }):
     && typeof model.preferredModelId !== "string") {
     return { error: "监工模型配置格式不正确。" };
   }
+  if (model.preferredReasoningValue !== undefined
+    && model.preferredReasoningValue !== null
+    && typeof model.preferredReasoningValue !== "string") {
+    return { error: "监工模型配置格式不正确。" };
+  }
   const preferredModelId = typeof model.preferredModelId === "string"
     ? model.preferredModelId.trim()
     : "";
   if (preferredModelId.length > 512) {
     return { error: "监工模型标识过长。" };
   }
-  if (!preferredModelId) return { config: { runtime } };
+  const preferredReasoningValue = typeof model.preferredReasoningValue === "string"
+    ? model.preferredReasoningValue.trim()
+    : "";
+  if (preferredReasoningValue.length > 512) {
+    return { error: "监工思考强度标识过长。" };
+  }
+  if (!preferredModelId && !preferredReasoningValue) return { config: { runtime } };
   return {
     config: {
       runtime,
-      model: { preferredModelId, runtimeKind: isAgentRuntimeKind(model.runtimeKind) ? model.runtimeKind : runtime },
+      model: {
+        ...(preferredModelId ? { preferredModelId } : {}),
+        ...(preferredReasoningValue ? { preferredReasoningValue } : {}),
+        runtimeKind: isAgentRuntimeKind(model.runtimeKind) ? model.runtimeKind : runtime,
+      },
     },
   };
 }
@@ -823,6 +1158,235 @@ const server = http.createServer(async (req, res) => {
         conversationStore: conversationStoreFor(workspaceId),
         agentConfigStore: configStore,
       }));
+      return;
+    }
+
+    // 指令链导图（工作树）：把会话落盘消息整形成父子链森林 DTO。
+    // 历史以落盘为准：historySince(0) 读全部 shard，再以内存现势覆盖同 id；
+    // 在跑状态与当前 plan 步经 RunManager 现势投影叠加（与 /api/state 同口径）。
+    if (req.method === "GET" && url.pathname.startsWith("/api/conversations/") && url.pathname.endsWith("/graph")) {
+      const parts = url.pathname.split("/");
+      const convId = parts[3];
+      if (!convId) { sendJson(res, 400, { ok: false, message: "Missing conversation id." }); return; }
+      const target = resolveTarget(url);
+      if (!target || target.conversationId !== convId) {
+        sendJson(res, 409, { ok: false, message: "workspaceId and conversationId are required." });
+        return;
+      }
+      const includeProblems = url.searchParams.get("problems") !== "0";
+      const includeSessions = url.searchParams.get("sessions") !== "0";
+      const includeCheckpoints = url.searchParams.get("checkpoints") !== "0";
+      const ctx = contextForTarget(target);
+      if (!ctx) {
+        sendJson(res, 200, {
+          workspaceId: target.workspaceId,
+          conversationId: convId,
+          generatedAt: new Date().toISOString(),
+          roots: [],
+          nodes: [],
+          edges: [],
+          problems: { enabled: includeProblems, items: [], clusters: [], totalItems: 0, truncated: false, dataIncomplete: false },
+          sessions: { enabled: includeSessions, agents: [], hasUnknownIntervals: false },
+          checkpoints: checkpointsBlockFor(target.workspaceId, convId, includeCheckpoints),
+        });
+        return;
+      }
+      const byId = new Map<string, ChatMessage>();
+      for (const message of ctx.messages.historySince(0)) byId.set(message.id, message);
+      for (const message of ctx.messages.list()) byId.set(message.id, message);
+      const merged = [...byId.values()].sort(
+        (a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id),
+      );
+      const projected = ctx.runManager.projectLiveProcessState(merged);
+      const agentLabels = new Map<AgentId, string>();
+      const agentRuntimes = new Map<AgentId, string>();
+      for (const agentState of ctx.agents.states()) {
+        agentLabels.set(agentState.id, agentState.label);
+        agentRuntimes.set(agentState.id, agentState.runtime);
+      }
+      const graphDto = buildConversationGraph({
+        workspaceId: target.workspaceId,
+        conversationId: convId,
+        messages: projected,
+        agentLabels,
+        agentRuntimes,
+        includeProblems,
+        includeSessions,
+        checkpoints: checkpointsBlockFor(target.workspaceId, convId, includeCheckpoints),
+      });
+      attachCompactionToGraph(graphDto, target.workspaceId, convId);
+      sendJson(res, 200, graphDto);
+      return;
+    }
+
+
+    // 压缩标记捕获状态（第三步试点）：供「会话状态」页签呈现开关与接入状态。
+    if (req.method === "GET" && url.pathname.startsWith("/api/conversations/") && url.pathname.endsWith("/engine-events/status")) {
+      const parts = url.pathname.split("/");
+      const convId = parts[3];
+      const target = convId ? resolveTarget(url) : null;
+      if (!convId || !target || target.conversationId !== convId) {
+        sendJson(res, 409, { ok: false, message: "workspaceId and conversationId are required." });
+        return;
+      }
+      const captureEnabled = compactionCaptureEnabled();
+      const ctx = contextForTarget(target);
+      const agents = ctx ? ctx.agents.states().map((state) => ({
+        agentId: state.id,
+        runtime: state.runtime,
+        state: state.runtime === COMPACTION_PILOT_RUNTIME
+          ? (captureEnabled ? "enabled" : "disabled")
+          : "unsupported",
+      })) : [];
+      sendJson(res, 200, { ok: true, captureEnabled, pilotRuntime: COMPACTION_PILOT_RUNTIME, agents });
+      return;
+    }
+
+    // 检查点（第二步 v1）：生成 / 删除 / 交接预览 / 交接。写端点组有独立
+    // 开关，关闭时服务端直接拒绝写操作；只读聚合走 graph DTO 的旁路块。
+    if (url.pathname.startsWith("/api/conversations/") && url.pathname.includes("/checkpoints")) {
+      const parts = url.pathname.split("/");
+      const convId = parts[3];
+      const checkpointId = parts[5];
+      const action = parts[6];
+      const target = convId ? resolveTarget(url) : null;
+      if (!convId || !target || target.conversationId !== convId) {
+        sendJson(res, 409, { ok: false, message: "workspaceId and conversationId are required." });
+        return;
+      }
+      if (req.method !== "GET" && !checkpointsWriteEnabled()) {
+        sendJson(res, 403, { ok: false, code: "checkpoints-disabled", message: "检查点写操作已关闭（ORBIT_CHECKPOINTS=0）。" });
+        return;
+      }
+      const conversationDir = workspaceStore.channelsDir(target.workspaceId, convId);
+      try {
+        if (req.method === "POST" && parts.length === 5) {
+          const ctx = contextForTarget(target);
+          if (!ctx) { sendJson(res, 409, { ok: false, message: "Conversation is not available." }); return; }
+          const snapshot = readConversationSnapshot(conversationDir);
+          const { sessions, problems } = checkpointDerivations(target, ctx, snapshot);
+          const conversation = conversationStoreFor(target.workspaceId).get(target.workspaceId, convId);
+          if (!conversation) { sendJson(res, 404, { ok: false, message: "Conversation not found." }); return; }
+          const result = createCheckpoint({
+            conversationDir,
+            workspaceConversationsRoot: path.dirname(conversationDir),
+            snapshot,
+            sessions,
+            problems: stripProblemsText(problems),
+            conversation,
+            config: checkpointConfig,
+          });
+          sendJson(res, 200, { ok: true, created: result.created, checkpointId: result.checkpointId, contentKey: result.contentKey });
+          return;
+        }
+        if (req.method === "DELETE" && checkpointId && parts.length === 6) {
+          deleteCheckpoint(conversationDir, checkpointId);
+          sendJson(res, 200, { ok: true, checkpointId });
+          return;
+        }
+        if (req.method === "GET" && checkpointId && action === "handoff-preview" && parts.length === 7) {
+          const packageDir = checkpointDir(conversationDir, checkpointId);
+          const manifest = readManifest(packageDir);
+          if (!manifest) { sendJson(res, 404, { ok: false, message: "检查点不存在或已删除。" }); return; }
+          const ctx = contextForTarget(target);
+          if (!ctx) { sendJson(res, 409, { ok: false, message: "Conversation is not available." }); return; }
+          const { material } = handoffMaterialFor(target, ctx, conversationDir, manifest);
+          sendJson(res, 200, { ok: true, checkpointId, ...material });
+          return;
+        }
+        if (req.method === "POST" && checkpointId && action === "handoff" && parts.length === 7) {
+          const input = (await readJson(req)) as { excerptHash?: unknown };
+          const excerptHash = typeof input.excerptHash === "string" ? input.excerptHash : "";
+          if (!excerptHash) { sendJson(res, 400, { ok: false, message: "excerptHash is required." }); return; }
+          const packageDir = checkpointDir(conversationDir, checkpointId);
+          const manifest = readManifest(packageDir);
+          if (!manifest) { sendJson(res, 404, { ok: false, message: "检查点不存在或已删除。" }); return; }
+          const ctx = contextForTarget(target);
+          if (!ctx) { sendJson(res, 409, { ok: false, message: "Conversation is not available." }); return; }
+          const { material } = handoffMaterialFor(target, ctx, conversationDir, manifest);
+          if (material.excerptHash !== excerptHash) {
+            sendJson(res, 409, { ok: false, code: "excerpt-stale", message: "源会话在预览后发生变化，请重新预览并确认摘录。" });
+            return;
+          }
+          const outcome = await withCheckpointLock(`${target.workspaceId}:${convId}:${checkpointId}`, async () => {
+            const claim = claimHandoffOperation(packageDir, checkpointId);
+            let op = claim.operation;
+            if (op.state === "done") {
+              return { alreadyDone: true, operationId: op.operationId, newConversationId: op.newConversationId };
+            }
+            try {
+              if (!op.newConversationId) {
+                let newConversationId = claim.reusableConversationId;
+                if (newConversationId) {
+                  const existing = conversationStoreFor(target.workspaceId).get(target.workspaceId, newConversationId);
+                  const existingCtx = existing ? getOrCreateContext(target.workspaceId, newConversationId) : null;
+                  if (!existing || !existingCtx || existingCtx.messages.list().length > 0) newConversationId = undefined;
+                }
+                if (!newConversationId) {
+                  const source = conversationStoreFor(target.workspaceId).get(target.workspaceId, convId);
+                  const created = conversationStoreFor(target.workspaceId).create(
+                    target.workspaceId,
+                    conversationTitle(`交接：${source?.name ?? convId}`),
+                  );
+                  newConversationId = created.id;
+                  getOrCreateContext(target.workspaceId, newConversationId);
+                }
+                op = { ...op, newConversationId, state: "session_created", excerptHash };
+                writeOperation(packageDir, op);
+              }
+              const newCtx = getOrCreateContext(target.workspaceId, op.newConversationId!);
+              if (op.entryMessageId) {
+                const stored = newCtx.messages.get(op.entryMessageId);
+                if (!stored || sha256Hex(stored.content) !== op.entryTextSha256 || !stored.content.includes(checkpointId)) {
+                  if (op.state === "entry_written" || op.state === "verified") {
+                    op = { ...op, state: "failed", error: "entry-missing-or-mismatch" };
+                    writeOperation(packageDir, op);
+                    throw new CheckpointError("entry-missing", "交接入口消息缺失或内容不符，操作已置失败；请重新交接。");
+                  }
+                  op = { ...op, entryMessageId: undefined, entryTextSha256: undefined };
+                }
+              }
+              if (!op.entryMessageId) {
+                // 只导入上下文：直接经消息存储落盘，不经消息路由，不触发 agent 执行。
+                const storedMessage = newCtx.messages.append({ kind: "system", content: material.fullText });
+                op = { ...op, entryMessageId: storedMessage.id, entryTextSha256: sha256Hex(material.fullText), state: "entry_written" };
+                writeOperation(packageDir, op);
+              }
+              const verify = newCtx.messages.get(op.entryMessageId!);
+              if (!verify || sha256Hex(verify.content) !== op.entryTextSha256 || !verify.content.includes(checkpointId)) {
+                op = { ...op, state: "failed", error: "entry-verify-failed" };
+                writeOperation(packageDir, op);
+                throw new CheckpointError("entry-verify-failed", "交接入口消息回读校验失败。");
+              }
+              op = { ...op, state: "verified" };
+              writeOperation(packageDir, op);
+              writeHandoffRecord(packageDir, {
+                checkpointId,
+                operationId: op.operationId,
+                newConversationId: op.newConversationId!,
+                entryMessageId: op.entryMessageId!,
+                completedAt: new Date().toISOString(),
+              });
+              op = { ...op, state: "done" };
+              writeOperation(packageDir, op);
+              return { alreadyDone: false, operationId: op.operationId, newConversationId: op.newConversationId };
+            } catch (error) {
+              if (op.state !== "done" && op.state !== "failed") {
+                try {
+                  writeOperation(packageDir, { ...op, state: "failed", error: error instanceof Error ? error.message : String(error) });
+                } catch { /* 失败记录写不下时不掩盖原错误 */ }
+              }
+              throw error;
+            }
+          });
+          sendJson(res, 200, { ok: true, ...outcome });
+          return;
+        }
+      } catch (error) {
+        sendCheckpointError(res, error);
+        return;
+      }
+      sendJson(res, 404, { ok: false, message: "Unknown checkpoints route." });
       return;
     }
 
@@ -1608,6 +2172,91 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+
+    // 默认接收员工（Dot 0076）：普通对话模式下无 @ 消息的固定收件人。
+    // 只改会话记录，不发送任何消息；agentId 必须是本工作区员工，null 为清除。
+    // 终结屏障（Dot 0096）：客户端每次变更带唯一 operationId，服务端按
+    // 会话串行执行（DefaultAgentOperationRegistry.runExclusive），并把该
+    // 操作登记为 pending → committed / failed。committed 的判据是落盘后
+    // 读回的持久值与目标一致；持久化失败时上下文回滚内存状态并抛错
+    // （见 ConversationContext.setDefaultDirectAgent），因此错误响应
+    // 重新成为「未提交」的可信信号。客户端在 PUT 结果不确定时凭操作号
+    // 查操作状态裁决终结，不再以单次重读的值解锁。
+    if (req.method === "PUT" && url.pathname.startsWith("/api/conversations/") && url.pathname.endsWith("/default-agent")) {
+      const parts = url.pathname.split("/");
+      const convId = parts[3];
+      if (!convId) { sendJson(res, 400, { ok: false, message: "Missing conversation id." }); return; }
+      const target = resolveTarget(url);
+      if (!target || target.conversationId !== convId) {
+        sendJson(res, 409, { ok: false, message: "workspaceId and conversationId are required." });
+        return;
+      }
+      const input = (await readJson(req)) as { agentId?: unknown; operationId?: unknown };
+      if (input.agentId !== null && typeof input.agentId !== "string") {
+        sendJson(res, 400, { ok: false, message: "agentId (string or null) is required." });
+        return;
+      }
+      const ctx = contextForTarget(target);
+      if (!ctx) { sendJson(res, 409, { ok: false, message: "No active conversation context." }); return; }
+      const agentId = input.agentId as AgentId | null;
+      const operationId = typeof input.operationId === "string" && input.operationId.length > 0
+        ? input.operationId
+        : null;
+      const operationKey = `${target.workspaceId}\n${convId}`;
+      await defaultAgentOperations.runExclusive(operationKey, async () => {
+        if (operationId) defaultAgentOperations.begin(operationKey, operationId, agentId);
+        try {
+          const current = conversationStoreFor(target.workspaceId).get(target.workspaceId, convId);
+          if (!current) throw new Error("Conversation not found.");
+          ctx.setDefaultDirectAgent(agentId);
+          const updated = conversationStoreFor(target.workspaceId).get(target.workspaceId, convId) ?? current;
+          if ((updated.lastDirectAgentId ?? null) !== agentId) {
+            // 读回的持久值与目标不一致：不得把这次变更报成已提交。
+            // 内存以读回的持久值为准对齐（其落盘值即当前磁盘值），
+            // 操作记为失败，客户端按未提交处理。
+            try {
+              ctx.setDefaultDirectAgent(updated.lastDirectAgentId ?? null);
+            } catch {
+              // 读回值对应的员工已不存在时保持内存现状，仍按失败上报。
+            }
+            throw new Error("Failed to persist the default direct agent.");
+          }
+          const operation = operationId
+            ? defaultAgentOperations.commit(operationKey, operationId, agentId)
+            : undefined;
+          sendJson(res, 200, { ok: true, conversation: updated, ...(operation ? { operation } : {}) });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const operation = operationId
+            ? defaultAgentOperations.fail(operationKey, operationId, message)
+            : undefined;
+          sendJson(res, 409, { ok: false, message, ...(operation ? { operation } : {}) });
+        }
+      });
+      return;
+    }
+
+    // 默认接收人变更的操作状态查询（Dot 0096 终结屏障）：客户端在 PUT
+    // 结果不确定时凭 operationId 查询该次变更是否已终结。查不到记录
+    //（服务端重启后操作表为空）返回 operation: null——重启后不存在
+    // 仍在途的 PUT，客户端可改以状态重读值作为终局权威值。
+    if (req.method === "GET" && url.pathname.startsWith("/api/conversations/") && url.pathname.endsWith("/default-agent-operation")) {
+      const parts = url.pathname.split("/");
+      const convId = parts[3];
+      if (!convId) { sendJson(res, 400, { ok: false, message: "Missing conversation id." }); return; }
+      const target = resolveTarget(url);
+      if (!target || target.conversationId !== convId) {
+        sendJson(res, 409, { ok: false, message: "workspaceId and conversationId are required." });
+        return;
+      }
+      const operationId = url.searchParams.get("operationId");
+      const operation = operationId
+        ? defaultAgentOperations.get(`${target.workspaceId}\n${convId}`, operationId)
+        : undefined;
+      sendJson(res, 200, { ok: true, operation: operation ?? null });
+      return;
+    }
+
     if (req.method === "PUT" && url.pathname.startsWith("/api/conversations/")) {
       const parts = url.pathname.split("/");
       const convId = parts[3];
@@ -1707,6 +2356,9 @@ const server = http.createServer(async (req, res) => {
   });
   await startServerWithRecovery();
   startPeriodicProbe();
+  // 后台预热模型快照：非强制语义只补缺失/出错的运行时，让首次打开设置面板
+  // 时已有清单可用，不必等冷探针；不阻塞启动，失败只记日志不影响服务。
+  void probeConfiguredAgentModels(false).catch(() => {});
 })();
 
 async function startServerWithRecovery(): Promise<void> {
@@ -2134,6 +2786,23 @@ async function handlePutAgents(req: http.IncomingMessage, res: http.ServerRespon
 
   // modelState 是 GET 响应合并的运行时快照，保存前剥离，避免污染 agents.json。
   const configs = input.map(({ modelState: _modelState, modelProbe: _modelProbe, ...config }) => config);
+  // 设置页保存防护：载荷偏好若恰好等于过期会话快照的当前值、且与库内已保存
+  // 偏好不同，拒绝保存，避免把较新的模型偏好静默盖回旧值。注意：刷新模型
+  // 列表不会自动解开拦截——mergeProbedConfigs 保留本地未保存的选择；解开
+  // 靠关闭面板不保存、重开后改回已保存偏好，或改选新值（Dot 0094 口径，
+  // 详见 agent-model-guard.ts）。
+  const staleOverwrite = findStaleSnapshotPreferenceOverwrite(
+    configStore.load(workspaceId),
+    configs,
+    agentModelStateStore.load(workspaceId),
+  );
+  if (staleOverwrite) {
+    sendJson(res, 409, {
+      ok: false,
+      message: `员工「${staleOverwrite.agentName}」的${staleOverwrite.field === "model" ? "模型" : "思考强度"}偏好已拒绝保存：提交的值与一份较早的会话记录相同，可能来自过期的模型列表，保存会覆盖较新的偏好。解开方法：关闭设置面板且不要保存，重新打开设置面板后直接保存（重新打开时当前选中项即已保存的偏好，未保存的更改会丢失）；或改选一个不等于该旧记录值的新偏好。注意：点「刷新模型列表」只会更新可选列表，不会自动把已修改的选择改回已保存偏好。本拦截只针对这一种过期值覆盖（特定签名），并非通用的并发保存保护。`,
+    });
+    return;
+  }
   configStore.save(workspaceId, configs);
   refreshEnabledAgentsForWorkspace(workspaceId, configs);
   if (workspaceId === activeWorkspaceId) allConfigs = configs;

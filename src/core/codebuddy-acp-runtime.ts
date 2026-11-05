@@ -43,11 +43,25 @@ export function buildCodeBuddyAcpCommand(): { file: string; args: string[] } {
 export function classifyCodeBuddyAnswerChunk(
   update: Parameters<NonNullable<AcpRuntimeDefinition["classifyAnswerChunk"]>>[0],
 ): ReturnType<NonNullable<AcpRuntimeDefinition["classifyAnswerChunk"]>> {
+  if (isCodeBuddyCompactionChunk(update)) return "ignore";
   const meta = update._meta;
   if (!meta || typeof meta !== "object") return undefined;
-  if (meta["codebuddy.ai/isCompactInternal"] === true) return "ignore";
   if (meta["codebuddy.ai/memberEvent"] !== undefined) return "progress";
   return undefined;
+}
+
+/**
+ * CodeBuddy 的上下文压缩内部帧：压缩摘要以普通 answer chunk 形态出现，靠
+ * `_meta["codebuddy.ai/isCompactInternal"] === true` 区分。主链分类为 ignore；
+ * 第三步试点在同一分类点旁路观测（见 acp-runtime 的 isCompactionMarkerChunk），
+ * 只记元数据，绝不读取或保存摘要正文。
+ */
+export function isCodeBuddyCompactionChunk(
+  update: Parameters<NonNullable<AcpRuntimeDefinition["classifyAnswerChunk"]>>[0],
+): boolean {
+  const meta = update._meta;
+  if (!meta || typeof meta !== "object") return false;
+  return meta["codebuddy.ai/isCompactInternal"] === true;
 }
 
 /**
@@ -225,6 +239,7 @@ export const CODEBUDDY_ACP: AcpRuntimeDefinition = {
   agentIdEnvNames: ["CODEBUDDY_AGENT_ID"],
   toolNameMetaKeys: ["codebuddy.ai/toolName"],
   classifyAnswerChunk: classifyCodeBuddyAnswerChunk,
+  isCompactionMarkerChunk: isCodeBuddyCompactionChunk,
   observeSessionUpdate: observeCodeBuddySessionUpdate,
   answerGroupKey: codeBuddyAnswerGroupKey,
   guardPooledSessionReplay: true,

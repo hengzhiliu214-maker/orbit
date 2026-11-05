@@ -14,7 +14,7 @@ import type {
   RunResult,
   RuntimeEvent,
 } from "../shared/types.ts";
-import { isAgentRunCancelledError, type AgentRuntime, type RecoveryPrompt } from "./agent-runtime.ts";
+import { isAgentRunCancelledError, type AgentRuntime } from "./agent-runtime.ts";
 import { sanitizeAgentVisibleReply } from "./agent-prompt.ts";
 import { isCleanFinalAnswer } from "./claude-output-detector.ts";
 import { EventBus } from "./event-bus.ts";
@@ -42,6 +42,7 @@ export type AgentSessionOptions = {
   workspaceId?: string;
   interactionTimeoutMs?: number;
   preferredModelId?: string;
+  preferredReasoningValue?: string;
   modelState?: AgentModelStateBridge;
 };
 
@@ -91,11 +92,13 @@ export class AgentSession {
   private runCount = 0;
   /** 首选模型可在会话运行期间更新（issue #153），下一次运行开始时生效。 */
   private preferredModelId?: string;
+  private preferredReasoningValue?: string;
   /** 斜杠命令缓存（issue #160）：只存内存，命令属于活的后端会话，不落盘。 */
   private sessionCommands: SessionCommands | null = null;
 
   constructor(private readonly options: AgentSessionOptions) {
     this.preferredModelId = options.preferredModelId;
+    this.preferredReasoningValue = options.preferredReasoningValue;
   }
 
   /**
@@ -104,6 +107,15 @@ export class AgentSession {
    */
   setPreferredModelId(preferredModelId?: string): void {
     this.preferredModelId = preferredModelId?.trim() || undefined;
+  }
+
+  /** 更新首选思考强度。语义同 setPreferredModelId：只改内存偏好，下一次运行生效。 */
+  setPreferredReasoningValue(preferredReasoningValue?: string): void {
+    this.preferredReasoningValue = preferredReasoningValue?.trim() || undefined;
+  }
+
+  preferredReasoning(): string | undefined {
+    return this.preferredReasoningValue;
   }
 
   preferredModel(): string | undefined {
@@ -136,7 +148,7 @@ export class AgentSession {
     }
   }
 
-  send(runId: string, prompt: string, attachments?: readonly MessageAttachment[], approvalMode: ApprovalMode = "ask", recoveryPrompt?: () => RecoveryPrompt): Promise<RunResult> {
+  send(runId: string, prompt: string, attachments?: readonly MessageAttachment[], approvalMode: ApprovalMode = "ask"): Promise<RunResult> {
     if (this.activeRun) {
       return Promise.reject(new Error(`${this.id} is already running`));
     }
@@ -149,11 +161,9 @@ export class AgentSession {
       this.options.runtime.kind, this.options.conversationId, this.id,
     );
 
-    return this.executeRun(runId, prompt, runIndex, existingSession?.sessionId ?? undefined, attachments, approvalMode, recoveryPrompt)
+    return this.executeRun(runId, prompt, runIndex, existingSession?.sessionId ?? undefined, attachments, approvalMode)
       .catch((error: unknown) => {
-        // ACP owns restoration before prompt delivery. Never replay a failed prompt
-        // based on its error text: it may already have performed side effects.
-        if (this.options.runtime.transport !== "acp" && this.isResumeFailure(error, existingSession)) {
+        if (this.isResumeFailure(error, existingSession)) {
           this.options.sessionStore.clear(
             this.options.runtime.kind, this.options.conversationId, this.id,
           );
@@ -285,7 +295,6 @@ export class AgentSession {
     resumeSessionId?: string,
     attachments?: readonly MessageAttachment[],
     approvalMode: ApprovalMode = "ask",
-    recoveryPrompt?: () => RecoveryPrompt,
   ): Promise<RunResult> {
     this.setStatus("running");
 
@@ -294,18 +303,28 @@ export class AgentSession {
       poolKey: `${this.options.conversationId}:${this.id}`,
       cwd: this.options.cwd,
       prompt,
-      recoveryPrompt,
       approvalMode,
       resumeSessionId,
       attachments,
       // 模型偏好（issue #142）：每次运行开始时读最近快照并惰性应用。
       // 读可变字段而非 options，使运行期更新的偏好在下一次运行生效（issue #153）。
       preferredModelId: this.preferredModelId,
+      preferredReasoningValue: this.preferredReasoningValue,
       lastSessionConfig: this.options.modelState?.load(this.id),
       onSessionConfig: this.options.modelState
         ? (snapshot) => this.options.modelState!.update(snapshot)
         : undefined,
       onSessionCommands: (commands, sessionId) => this.rememberCommands(sessionId, commands),
+      onCompactionMarker: (info) => {
+        this.publish({
+          type: "run.compactionMarker",
+          conversationId: this.options.conversationId,
+          agentId: this.id,
+          runId,
+          sessionId: info.sessionId,
+          ...(info.messageId ? { messageId: info.messageId } : {}),
+        });
+      },
       requestPermission: (request) => this.requestPermission(runId, request),
       requestElicitation: (request) => this.requestElicitation(runId, request),
       onOutput: (text) => {

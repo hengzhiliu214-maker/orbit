@@ -297,9 +297,7 @@ generic `application/octet-stream` download with `nosniff` (see
 
 ## Session Persistence
 
-Each agent's backend session ID is persisted via `src/core/session-store.ts`. Session records are namespaced by runtime, channel, conversation, and agent so switching an agent between Codex, Claude Code, and CodeBuddy does not reuse an incompatible session ID. Records also identify the transport and protocol version when available. On subsequent runs, ACP runtimes prefer `session/resume` when advertised and otherwise use `session/load`; load-time history notifications are ignored because Orbit's message store remains the canonical conversation history. When restoration reports a known unrecoverable session, the ACP adapter creates a replacement before submitting the prompt. RunManager supplies a lazy recovery prompt from the same workspace/conversation's loaded message history, including completed turns that normal incremental context omits. The existing 12000-character budget and truncation rules still apply; the current source message is excluded by ID and current attachments are delivered once. A process notice distinguishes available history backfill from missing history; older retained history may be unavailable or truncated. Native slash commands remain verbatim and receive no history injection.
-
-Transport failures during restore retry the same session on one fresh connection; unknown errors fail without automatic fallback. Runtimes with neither load nor resume support also create a replacement before prompt delivery. ACP recovery stays inside session setup: AgentSession never retries an entire ACP turn based on error text after a prompt may have executed.
+Each agent's backend session ID is persisted via `src/core/session-store.ts`. Session records are namespaced by runtime, channel, conversation, and agent so switching an agent between Codex, Claude Code, and CodeBuddy does not reuse an incompatible session ID. Records also identify the transport and protocol version when available. On subsequent runs, ACP runtimes prefer `session/resume` when advertised and otherwise use `session/load`; load-time history notifications are ignored because Orbit's message store remains the canonical conversation history. If restoration fails (e.g. session expired), the store is cleared and the run retries with a new session.
 
 Session files are stored under `~/.orbit/sessions/<workspaceId>/<runtime>/<channelId>/<conversationId>/<agentId>.json`, namespaced by runtime, channel, conversation, and agent.
 
@@ -418,6 +416,10 @@ Retention and load limits can be tuned with:
 - `ORBIT_TRANSCRIPT_TAIL_BYTES`
 - `ORBIT_MESSAGE_RECENT_SHARDS`
 
+## Conversation Session Status
+
+The conversation graph response includes an optional, independently degradable session-status projection from visible messages. For each employee, consecutive messages with the same recorded session ID form observed segments; messages without one form unknown intervals excluded from segment totals. Segment boundaries count observed session ID switches, not proven session rebuilds. Counts cover only history available since first observation and are limited by message retention (90 days by default); user turns follow graph parent ancestry and runs use distinct recorded run IDs. The optional turn reminder is a browser-local preference and does not change runtime sessions.
+
 ## Collaboration Insights
 
 `GET /api/work-analysis` builds workspace-scoped task metrics from persisted message trees without loading every historical shard. A task is anchored to its originating user message (or the highest in-window ancestor for long-running work) and includes:
@@ -428,6 +430,14 @@ Retention and load limits can be tuned with:
 - per-run offsets and durations for sequential/parallel timeline rendering
 
 Completed-task median duration excludes running, failed, and cancelled tasks. Cancelling an intermediate queued branch does not override a later successful outcome.
+
+## Conversation Checkpoints
+
+Manual checkpoints (anti-collapse archives) live under the conversation's own data directory at `conversations/<workspaceId>/<conversationId>/archives/ckpt-<timestamp>-<seq>/`. The stable policy stores indexes and structure only — a per-message index (ids, timestamps, run/session ids, char counts, content hashes), the session-status snapshot, the problem-board structure with text hashes instead of text, and the conversation record — plus a deterministic manifest. Message bodies are never copied into a package; the reuse key (`contentKey`) covers source shard hashes, the selection scope, and derivation/schema versions (not generation timestamps), so regenerating from unchanged source returns the existing package. Packages are capped per conversation and per workspace; deletion moves a package to `archives/.trash/` first. Handoff to a new conversation is an explicit, confirmed flow: the entry material (fact index plus a size-capped verbatim excerpt) is assembled from the live source at handoff time, previewed by the user, and written as a context-import message that never triggers agent execution and never inherits the old conversation's authorization. Handoff progress is persisted as an operation record inside the package before any side effect, so a crash mid-handoff resumes by verifying what already landed instead of duplicating it. Checkpoint writes sit behind their own server-side switch (`ORBIT_CHECKPOINTS=0` disables) and endpoint group; the read side is a degradable block in the conversation graph DTO.
+
+## Observed Compaction Markers (CodeBuddy pilot)
+
+CodeBuddy exposes context compaction only as internal answer chunks flagged `_meta["codebuddy.ai/isCompactInternal"]`, which the answer classifier discards. An optional observer beside that classification point (after the replay guard, live path only) records metadata — never the summary text — as `run.compactionMarker` events; the server appends them to `engine-events.ndjson` in the conversation directory, alongside `coverage_start` markers written when capture is active. Capture is per-engine and off by default (`ORBIT_COMPACTION_CAPTURE=codebuddy`), enforced server-side: when off, nothing is written or read and the graph DTO is unchanged. The session-status derivation merges adjacent marker chunks of one (agent, session, run) into observed marker segments and assigns a segment to a session segment only on a unique session-id + time-window match. These are observed markers, not engine-reported compaction events, so the UI never presents them as exact compaction counts; coverage intervals and gaps (bad lines, retention exclusion) are shown with the data. Event retention follows the message window (90 days by default) at derivation time; the file itself is append-only.
 
 ## Future Extension Points
 
