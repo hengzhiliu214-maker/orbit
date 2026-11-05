@@ -598,6 +598,57 @@ export type ConversationGraphProblems = {
   dataIncomplete: boolean;
 };
 
+/** 自首次观测以来的会话段；受消息保留期（默认 90 天）限制，段界仅表示已观测 sessionId 切换。 */
+export type ConversationSessionSegment = {
+  type: "segment";
+  index: number;
+  sessionId: string;
+  sessionShortId: string;
+  startedAt: string;
+  lastActivityAt: string;
+  firstObservedAt: string;
+  userTurns: number;
+  runCount: number;
+  messageCount: number;
+  charCount: number;
+};
+
+/** 未记录 sessionId 的连续消息，不并入会话段汇总。 */
+export type ConversationSessionUnknownInterval = {
+  type: "unknown";
+  startedAt: string;
+  lastActivityAt: string;
+  messageCount: number;
+  charCount: number;
+};
+
+export type ConversationSessionBlock = ConversationSessionSegment | ConversationSessionUnknownInterval;
+
+export type ConversationAgentSessions = {
+  agentId: AgentId;
+  agentLabel?: string;
+  runtime?: string;
+  isSupervisor: boolean;
+  blocks: ConversationSessionBlock[];
+  segmentCount: number;
+  switchCount: number;
+  distinctSessionCount: number;
+  unknownIntervalCount: number;
+  unknownMessageCount: number;
+  totalUserTurns: number;
+  totalRuns: number;
+  totalMessages: number;
+  totalChars: number;
+};
+
+/** 只读派生，可关闭或降级；不推断会话重建，不设健康分或默认阈值。 */
+export type ConversationGraphSessions = {
+  enabled: boolean;
+  degraded?: boolean;
+  agents: ConversationAgentSessions[];
+  hasUnknownIntervals: boolean;
+};
+
 export type ConversationGraph = {
   workspaceId: string;
   conversationId: string;
@@ -606,6 +657,7 @@ export type ConversationGraph = {
   nodes: ConversationGraphNode[];
   edges: ConversationGraphEdge[];
   problems: ConversationGraphProblems;
+  sessions: ConversationGraphSessions;
 };
 
 export type MessageHistoryState = {

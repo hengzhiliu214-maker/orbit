@@ -453,6 +453,75 @@ function ProblemBoard(props: {
   );
 }
 
+const SESSION_BUDGET_KEY = "orbit.sessionTurnBudget";
+
+function parseSessionBudget(value: string): number | null {
+  if (!/^[0-9]+$/.test(value)) return null;
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number > 0 ? number : null;
+}
+
+function formatDateTime(iso: string): string {
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? "" : date.toLocaleString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+}
+
+function SessionBoard(props: {
+  graph: ConversationGraph | null;
+  error: string | null;
+  sessionsEnabled: boolean;
+  onToggleSessions: (enabled: boolean) => void;
+}) {
+  const [budgetInput, setBudgetInput] = useState(() => {
+    try {
+      const stored = window.localStorage.getItem(SESSION_BUDGET_KEY) ?? "";
+      if (stored && parseSessionBudget(stored) === null) window.localStorage.removeItem(SESSION_BUDGET_KEY);
+      return parseSessionBudget(stored) === null ? "" : stored;
+    } catch { return ""; }
+  });
+  const budget = parseSessionBudget(budgetInput);
+  const header = <>
+    <div className="problemBoardHead">
+      <span className="sessionBoardNote">按落盘消息派生，自首次观测以来；受消息保留期（默认 90 天）限制，更早的历史不可见。段按消息时间（createdAt，同刻按消息 id）排序切分。段界只记『已观测 sessionId 切换』，不等于已证实的会话重建。无 sessionId 的消息列入未知区间，不并入任何计数。</span>
+      <label className="problemToggle"><input type="checkbox" checked={props.sessionsEnabled} onChange={(event) => props.onToggleSessions(event.target.checked)} />启用</label>
+    </div>
+    <label className="sessionBudgetRow">提醒预算（可选）：某位员工当前会话段的用户轮次超过 <input type="number" min="1" step="1" value={budgetInput} onChange={(event) => {
+      const value = event.target.value;
+      setBudgetInput(value);
+      try {
+        if (parseSessionBudget(value) === null) window.localStorage.removeItem(SESSION_BUDGET_KEY);
+        else window.localStorage.setItem(SESSION_BUDGET_KEY, value);
+      } catch { /* 存储不可用时仅在当前页面生效。 */ }
+    }} /> 次时给出提醒</label>
+  </>;
+  if (!props.graph) return <div className="sessionBoard">{header}<div className="graphEmpty">{props.error ?? "加载中…"}</div></div>;
+  const sessions = props.graph.sessions;
+  if (!sessions?.enabled) return <div className="sessionBoard">{header}<div className="graphEmpty">会话状态已关闭。</div></div>;
+  if (sessions.degraded) return <div className="sessionBoard">{header}<div className="graphEmpty">会话状态暂时不可用（统计已降级）。</div></div>;
+  return <div className="sessionBoard">{header}
+    {sessions.agents.length === 0 ? <div className="graphEmpty">本会话还没有员工执行记录。</div> : sessions.agents.map((agent) => {
+      const lastSegment = agent.blocks.filter((block) => block.type === "segment").at(-1);
+      const overBudget = budget !== null && lastSegment !== undefined && lastSegment.userTurns > budget;
+      return <section className="sessionAgent" key={agent.agentId}>
+        <div className="sessionAgentHead"><strong>{agent.agentLabel ?? agent.agentId}</strong>
+          {agent.runtime ? <span className="graphRuntimeBadge">{agent.runtime}</span> : null}
+          {agent.isSupervisor ? <span className="sessionCurrentTag">监工</span> : null}
+          {overBudget ? <span className="sessionOverBadge">超预算</span> : null}
+        </div>
+        <div className="sessionSummary">已观测会话段 {agent.segmentCount} · 已观测切换 {agent.switchCount} 次 · 不同会话 {agent.distinctSessionCount} 个 · 用户轮次 {agent.totalUserTurns} · 执行 {agent.totalRuns} 次 · 消息 {agent.totalMessages} 条 · 共 {agent.totalChars} 字
+          {agent.unknownIntervalCount > 0 ? <> · 未知区间 {agent.unknownIntervalCount} 处（{agent.unknownMessageCount} 条消息未记录 sessionId，未并入计数）</> : null}
+        </div>
+        <div className="sessionBlockList">{agent.blocks.map((block, index) => block.type === "unknown" ?
+          <div className="sessionBlock unknown" key={index}>未知区间 · {formatDateTime(block.startedAt)} – {formatDateTime(block.lastActivityAt)} · {block.messageCount} 条消息未记录 sessionId</div> :
+          <div className="sessionBlock" key={index}>第 {block.index} 段 · 会话 <span className="sessionSegId" title={block.sessionId}>{block.sessionShortId}…</span> · 首次观测 {formatDateTime(block.firstObservedAt)} · 最近活动 {formatDateTime(block.lastActivityAt)} · 用户轮次 {block.userTurns} · 执行 {block.runCount} 次 · 消息 {block.messageCount} 条 · {block.charCount} 字
+            {block === lastSegment ? <span className="sessionCurrentTag">现行</span> : null}
+            {block === lastSegment && overBudget ? <span className="sessionOverBadge">超预算</span> : null}
+          </div>)}</div>
+      </section>;
+    })}
+  </div>;
+}
+
 export function GraphPanel(props: {
   workspaceId: string;
   conversationId: string;
@@ -461,12 +530,17 @@ export function GraphPanel(props: {
   overlay?: boolean;
   onLocateMessage: (messageId: string) => void;
   onClose: () => void;
+  onSessionsIssueChange?: (issue: boolean) => void;
 }) {
   const [graph, setGraph] = useState<ConversationGraph | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedRootId, setSelectedRootId] = useState<string>("");
-  const [activeTab, setActiveTab] = useState<"tree" | "problems">("tree");
+  const [activeTab, setActiveTab] = useState<"tree" | "problems" | "sessions">("tree");
   const [problemsEnabled, setProblemsEnabled] = useState(true);
+  const [sessionsEnabled, setSessionsEnabled] = useState(true);
+  const issueRef = useRef(false);
+  const issueCallbackRef = useRef(props.onSessionsIssueChange);
+  issueCallbackRef.current = props.onSessionsIssueChange;
   const followLatestRef = useRef(true);
   const graphRef = useRef<ConversationGraph | null>(null);
   graphRef.current = graph;
@@ -475,6 +549,7 @@ export function GraphPanel(props: {
     if (!props.workspaceId || !props.conversationId) return;
     const query = new URLSearchParams({ workspaceId: props.workspaceId, conversationId: props.conversationId });
     if (!problemsEnabled) query.set("problems", "0");
+    if (!sessionsEnabled) query.set("sessions", "0");
     const response = await fetch(
       `/api/conversations/${encodeURIComponent(props.conversationId)}/graph?${query.toString()}`,
       { signal },
@@ -492,7 +567,7 @@ export function GraphPanel(props: {
       }
       return current;
     });
-  }, [props.workspaceId, props.conversationId, problemsEnabled]);
+  }, [props.workspaceId, props.conversationId, problemsEnabled, sessionsEnabled]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -523,6 +598,20 @@ export function GraphPanel(props: {
     setSelectedRootId("");
     setGraph(null);
     setActiveTab("tree");
+  }, [props.conversationId]);
+
+  useEffect(() => {
+    const sessions = graph?.conversationId === props.conversationId ? graph.sessions : undefined;
+    const issue = Boolean(sessions?.enabled && (sessions.degraded || sessions.hasUnknownIntervals));
+    if (issue !== issueRef.current) {
+      issueRef.current = issue;
+      issueCallbackRef.current?.(issue);
+    }
+  }, [graph, props.conversationId]);
+
+  useEffect(() => () => {
+    issueRef.current = false;
+    issueCallbackRef.current?.(false);
   }, [props.conversationId]);
 
   const roots = graph?.roots ?? [];
@@ -559,7 +648,12 @@ export function GraphPanel(props: {
             <span className="graphTabCount">{graph.problems.totalItems}</span>
           ) : null}
         </button>
+        <button type="button" role="tab" aria-selected={activeTab === "sessions"} className={`graphTabBtn${activeTab === "sessions" ? " active" : ""}`} onClick={() => setActiveTab("sessions")}>
+          会话状态
+          {graph?.sessions?.enabled && graph.sessions.hasUnknownIntervals ? <span className="graphTabWarn" title="存在未记录 sessionId 的未知区间">!</span> : null}
+        </button>
       </div>
+      {activeTab === "sessions" ? <SessionBoard graph={graph} error={error} sessionsEnabled={sessionsEnabled} onToggleSessions={setSessionsEnabled} /> : null}
       {activeTab === "problems" ? (
         <ProblemBoard
           graph={graph}

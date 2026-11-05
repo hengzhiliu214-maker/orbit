@@ -10,6 +10,7 @@ import type {
 import { INTERNAL_SUPERVISOR_ID } from "./agent-profiles.ts";
 import { assignmentPattern } from "./mention-router.ts";
 import { buildProblemBoard, emptyProblems } from "./conversation-problems.ts";
+import { buildConversationSessions, emptySessions } from "./conversation-sessions.ts";
 
 export type BuildConversationGraphOptions = {
   workspaceId: string;
@@ -20,6 +21,8 @@ export type BuildConversationGraphOptions = {
   now?: Date;
   /** 问题台派生开关（默认开）；关闭时 problems.enabled=false 且节点 obstacleCount 恒 0，原图不受影响。 */
   includeProblems?: boolean;
+  /** 会话状态纯派生开关，默认开启。 */
+  includeSessions?: boolean;
 };
 
 /**
@@ -152,6 +155,15 @@ export function buildConversationGraph(options: BuildConversationGraphOptions): 
     }
   }
 
+  let sessions = emptySessions(options.includeSessions !== false);
+  if (options.includeSessions !== false) {
+    try {
+      sessions = buildConversationSessions({ messages: visible, agentLabels: options.agentLabels, agentRuntimes: options.agentRuntimes });
+    } catch {
+      sessions = emptySessions(true, true);
+    }
+  }
+
   return {
     workspaceId: options.workspaceId,
     conversationId: options.conversationId,
@@ -160,6 +172,7 @@ export function buildConversationGraph(options: BuildConversationGraphOptions): 
     nodes,
     edges,
     problems,
+    sessions,
   };
 }
 

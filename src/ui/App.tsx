@@ -151,6 +151,7 @@ export function App() {
   const [state, setState] = useState<AppState>(initialState);
   const [activeView, setActiveView] = useState<ActiveView>(loadActiveView);
   const [graphPanelVisible, setGraphPanelVisible] = useState<boolean>(loadGraphPanelVisible);
+  const [sessionDataIssue, setSessionDataIssue] = useState(false);
   const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
   const highlightTimerRef = useRef<number | null>(null);
   const [content, setContent] = useState("");
@@ -247,6 +248,8 @@ export function App() {
       // The view still works when storage is unavailable; only reload persistence is lost.
     }
   }, [activeView]);
+
+  useEffect(() => { setSessionDataIssue(false); }, [state.conversation.id]);
 
   useEffect(() => {
     try {
@@ -2166,6 +2169,7 @@ export function App() {
             >
               指令链
             </button>
+            {sessionDataIssue ? <span className="sessionDataMark" title="会话状态数据存在未知区间或统计已降级，详见指令链面板的『会话状态』页签">会话数据含未知区间</span> : null}
             <Avatar.Group size="28px" max={4}>
               {state.agents.map((agent) => <Avatar key={agent.id} style={{ backgroundColor: agentColor(agent.id) }}>{agent.label.slice(0, 1)}</Avatar>)}
             </Avatar.Group>
@@ -2553,6 +2557,7 @@ export function App() {
           workspaceId={state.workspace.id}
           conversationId={state.conversation.id}
           liveSignature={graphLiveSignature}
+          onSessionsIssueChange={setSessionDataIssue}
           overlay={isCompactViewport}
           onLocateMessage={(messageId) => { void revealMessage(messageId); }}
           onClose={() => setGraphPanelVisible(false)}

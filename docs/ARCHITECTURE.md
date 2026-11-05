@@ -416,6 +416,10 @@ Retention and load limits can be tuned with:
 - `ORBIT_TRANSCRIPT_TAIL_BYTES`
 - `ORBIT_MESSAGE_RECENT_SHARDS`
 
+## Conversation Session Status
+
+The conversation graph response includes an optional, independently degradable session-status projection from visible messages. For each employee, consecutive messages with the same recorded session ID form observed segments; messages without one form unknown intervals excluded from segment totals. Segment boundaries count observed session ID switches, not proven session rebuilds. Counts cover only history available since first observation and are limited by message retention (90 days by default); user turns follow graph parent ancestry and runs use distinct recorded run IDs. The optional turn reminder is a browser-local preference and does not change runtime sessions.
+
 ## Collaboration Insights
 
 `GET /api/work-analysis` builds workspace-scoped task metrics from persisted message trees without loading every historical shard. A task is anchored to its originating user message (or the highest in-window ancestor for long-running work) and includes:

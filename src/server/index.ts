@@ -925,6 +925,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const includeProblems = url.searchParams.get("problems") !== "0";
+      const includeSessions = url.searchParams.get("sessions") !== "0";
       const ctx = contextForTarget(target);
       if (!ctx) {
         sendJson(res, 200, {
@@ -935,6 +936,7 @@ const server = http.createServer(async (req, res) => {
           nodes: [],
           edges: [],
           problems: { enabled: includeProblems, items: [], clusters: [], totalItems: 0, truncated: false, dataIncomplete: false },
+          sessions: { enabled: includeSessions, agents: [], hasUnknownIntervals: false },
         });
         return;
       }
@@ -958,6 +960,7 @@ const server = http.createServer(async (req, res) => {
         agentLabels,
         agentRuntimes,
         includeProblems,
+        includeSessions,
       }));
       return;
     }
