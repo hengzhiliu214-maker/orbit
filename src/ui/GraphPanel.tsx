@@ -547,6 +547,7 @@ function SessionBoard(props: {
   if (!sessions?.enabled) return <div className="sessionBoard">{header}<div className="graphEmpty">会话状态已关闭。</div>{checkpointSection}</div>;
   if (sessions.degraded) return <div className="sessionBoard">{header}<div className="graphEmpty">会话状态暂时不可用（统计已降级）。</div>{checkpointSection}</div>;
   return <div className="sessionBoard">{header}
+    {checkpointSection}
     {sessions.compactionCoverage ? <div className="sessionSummary">压缩标记覆盖区间 {sessions.compactionCoverage.intervals.length} 个{sessions.compactionCoverage.degraded ? <> · 覆盖存在缺口（事件记录含坏行）</> : null}{sessions.compactionCoverage.retentionExcluded ? <> · 部分早期事件已超 {sessions.compactionCoverage.retentionDays} 天留存窗口，未计入</> : null}</div> : null}
     {sessions.agents.length === 0 ? <div className="graphEmpty">本会话还没有员工执行记录。</div> : sessions.agents.map((agent) => {
       const lastSegment = agent.blocks.filter((block) => block.type === "segment").at(-1);
@@ -569,7 +570,6 @@ function SessionBoard(props: {
           </div>)}</div>
       </section>;
     })}
-    {checkpointSection}
   </div>;
 }
 
