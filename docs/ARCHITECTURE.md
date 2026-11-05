@@ -297,9 +297,7 @@ generic `application/octet-stream` download with `nosniff` (see
 
 ## Session Persistence
 
-Each agent's backend session ID is persisted via `src/core/session-store.ts`. Session records are namespaced by runtime, channel, conversation, and agent so switching an agent between Codex, Claude Code, and CodeBuddy does not reuse an incompatible session ID. Records also identify the transport and protocol version when available. On subsequent runs, ACP runtimes prefer `session/resume` when advertised and otherwise use `session/load`; load-time history notifications are ignored because Orbit's message store remains the canonical conversation history. When restoration reports a known unrecoverable session, the ACP adapter creates a replacement before submitting the prompt. RunManager supplies a lazy recovery prompt from the same workspace/conversation's loaded message history, including completed turns that normal incremental context omits. The existing 12000-character budget and truncation rules still apply; the current source message is excluded by ID and current attachments are delivered once. A process notice distinguishes available history backfill from missing history; older retained history may be unavailable or truncated. Native slash commands remain verbatim and receive no history injection.
-
-Transport failures during restore retry the same session on one fresh connection; unknown errors fail without automatic fallback. Runtimes with neither load nor resume support also create a replacement before prompt delivery. ACP recovery stays inside session setup: AgentSession never retries an entire ACP turn based on error text after a prompt may have executed.
+Each agent's backend session ID is persisted via `src/core/session-store.ts`. Session records are namespaced by runtime, channel, conversation, and agent so switching an agent between Codex, Claude Code, and CodeBuddy does not reuse an incompatible session ID. Records also identify the transport and protocol version when available. On subsequent runs, ACP runtimes prefer `session/resume` when advertised and otherwise use `session/load`; load-time history notifications are ignored because Orbit's message store remains the canonical conversation history. If restoration fails (e.g. session expired), the store is cleared and the run retries with a new session.
 
 Session files are stored under `~/.orbit/sessions/<workspaceId>/<runtime>/<channelId>/<conversationId>/<agentId>.json`, namespaced by runtime, channel, conversation, and agent.
 
@@ -417,6 +415,10 @@ Retention and load limits can be tuned with:
 - `ORBIT_TRANSCRIPT_MAX_BYTES`
 - `ORBIT_TRANSCRIPT_TAIL_BYTES`
 - `ORBIT_MESSAGE_RECENT_SHARDS`
+
+## Conversation Session Status
+
+The conversation graph response includes an optional, independently degradable session-status projection from visible messages. For each employee, consecutive messages with the same recorded session ID form observed segments; messages without one form unknown intervals excluded from segment totals. Segment boundaries count observed session ID switches, not proven session rebuilds. Counts cover only history available since first observation and are limited by message retention (90 days by default); user turns follow graph parent ancestry and runs use distinct recorded run IDs. The optional turn reminder is a browser-local preference and does not change runtime sessions.
 
 ## Collaboration Insights
 

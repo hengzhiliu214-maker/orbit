@@ -80,12 +80,12 @@ export type PendingPermission = AgentPermissionRequest & {
   expiresAt: string;
 };
 
-export type AgentRuntimeKind = "claude-code" | "codex" | "codebuddy";
+export type AgentRuntimeKind = "claude-code" | "codex" | "codebuddy" | "dsh" | "workbuddy";
 
-export const AGENT_RUNTIME_KINDS: readonly AgentRuntimeKind[] = ["claude-code", "codex", "codebuddy"];
+export const AGENT_RUNTIME_KINDS: readonly AgentRuntimeKind[] = ["claude-code", "codex", "codebuddy", "dsh", "workbuddy"];
 
 export function isAgentRuntimeKind(value: unknown): value is AgentRuntimeKind {
-  return value === "claude-code" || value === "codex" || value === "codebuddy";
+  return value === "claude-code" || value === "codex" || value === "codebuddy" || value === "dsh" || value === "workbuddy";
 }
 
 export type ChannelWatchTriggers = {
@@ -114,6 +114,8 @@ export function hasActiveChannelWatchTriggers(triggers?: ChannelWatchTriggers): 
  */
 export type AgentModelPreference = {
   preferredModelId?: string;
+  /** 思考强度偏好：runtime 会话配置项（如 thought_level）里的 value ID，原样保存、不做跨 runtime 转换。缺省为跟随运行时默认。 */
+  preferredReasoningValue?: string;
   runtimeKind: AgentRuntimeKind;
 };
 
@@ -156,6 +158,8 @@ export type AgentProfile = {
   triggers?: ChannelWatchTriggers;
   /** 已按 runtime 匹配门控的首选模型 ID（issue #142）；运行开始时惰性应用。 */
   preferredModelId?: string;
+  /** 已按 runtime 匹配门控的首选思考强度；运行开始时在模型之后惰性应用。 */
+  preferredReasoningValue?: string;
   internal?: boolean;
 };
 
@@ -170,6 +174,21 @@ export type AgentModelChoice = {
  * 都会返回 config options；Orbit 抽取其中 category 为 "model" 的 select 选项
  * 生成本快照。choices 为空表示该 runtime 不提供模型选择。
  */
+/**
+ * 员工 runtime 会话的思考强度配置快照。只对已核实提供标准思考强度配置项的
+ * runtime 产生（CodeBuddy 的 thought_level、dsh 的 reasoning_effort）；choices
+ * 与 currentValue 均为 runtime 原样上报，不做同义转换。
+ */
+export type AgentReasoningStateSnapshot = {
+  /** 思考强度选项在 ACP config options 里的 configId（如 "thought_level"）。 */
+  configId: string;
+  choices: AgentModelChoice[];
+  currentValue: string | undefined;
+  /** currentValue 是否来自真实员工会话；探测会话只提供可选列表。 */
+  currentValueSource?: "probe" | "session";
+  updatedAt: string;
+};
+
 export type AgentModelStateSnapshot = {
   agentId: AgentId;
   runtimeKind: AgentRuntimeKind;
@@ -179,6 +198,15 @@ export type AgentModelStateSnapshot = {
   currentValue: string | undefined;
   /** currentValue 是否来自真实员工会话；探测会话只提供可选列表。 */
   currentValueSource?: "probe" | "session";
+  /** 思考强度快照（仅已核实提供该配置项的 runtime 附带）。 */
+  reasoning?: AgentReasoningStateSnapshot;
+  /**
+   * 模型下发路径。缺省（undefined）为 config_option：经 session config 的
+   * model 选项下发；"session_model" 表示 choices 是带思考强度的变体
+   * modelId（如 Codex 的 gpt-5.6-terra[high]），只能经 legacy
+   * session/set_model 下发，两条路径不得混用或互相覆盖。
+   */
+  modelApplyPath?: "config_option" | "session_model";
   updatedAt: string;
 };
 
@@ -456,6 +484,180 @@ export type WorkAnalysis = {
   };
   trend: WorkAnalysisTrendPoint[];
   tasks: WorkTask[];
+};
+
+export type ConversationGraphNodeStatus = "queued" | "running" | "cancelling" | "completed" | "failed" | "cancelled";
+
+/**
+ * 指令链导图（工作树）的一个节点：根用户消息（kind "root"）或一次数字员工
+ * 执行（kind "run"，对应一条带 runId 的 agent 消息）。origin 由落盘父链推导：
+ * 直接父消息为 system（监工指令消息）或父节点为监工本人时记 supervisor。
+ * 注意：落盘数据没有逐 run 的模型名，节点只带员工显示名与 runtime。
+ */
+/** 节点类型（一等概念）：指令=根用户指令；执行=进行中的 run；结论=已完成且有产出的终态 run；阻碍不占树节点，见 ConversationGraphProblemItem。 */
+export type ConversationGraphNodeType = "instruction" | "execution" | "conclusion";
+
+export type ConversationGraphNode = {
+  id: string;
+  kind: "root" | "run";
+  nodeType: ConversationGraphNodeType;
+  messageId: string;
+  runId?: string;
+  agentId?: AgentId;
+  agentLabel?: string;
+  runtime?: string;
+  origin: "user" | "agent" | "supervisor";
+  parentNodeId?: string;
+  rootId: string;
+  routeDepth?: number;
+  routeState?: MessageRouteState;
+  /** 供前端淡化：路由被 blocked，或从未派出任何执行的根消息（ignored）。 */
+  dimmed: boolean;
+  status?: ConversationGraphNodeStatus;
+  title: string;
+  createdAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  /** 正在执行的节点当前 plan 步（仅 items 格式 plan 且有 in_progress 条目时）。 */
+  planCurrentStep?: string;
+  childCount: number;
+  /** 该节点关联的阻碍条目数（问题台派生计数；0 时前端不渲染徽标）。 */
+  obstacleCount: number;
+  /** 重试折叠信息：同父同员工的重试链中，非末次尝试 folded=true，前端默认折叠到末次尝试下。 */
+  retry?: { groupId: string; attempt: number; totalAttempts: number; folded: boolean };
+};
+
+export type ConversationGraphEdge = {
+  id: string;
+  source: string;
+  target: string;
+  /** 源节点消息的路由状态：描述这条边所代表的那次派发如何被处理。 */
+  routeState?: MessageRouteState;
+  dimmed: boolean;
+};
+
+export type ConversationGraphRoot = {
+  id: string;
+  title: string;
+  createdAt: string;
+  /** 无任何执行后代的根为 idle；其余按后代运行聚合（口径见 conversation-graph）。 */
+  status: ConversationGraphNodeStatus | "idle";
+  nodeCount: number;
+  latestActivityAt: string;
+};
+
+/** 问题台条目类别：失败 / 取消 / 路由阻断 / 工具失败（结算计数）。 */
+export type ConversationGraphProblemKind = "run-failed" | "run-cancelled" | "route-blocked" | "tool-failed";
+
+/**
+ * 问题台的一条阻碍记录。text 为落盘字段的逐字搬运（不摘要、不改写）；
+ * 注意落盘字段本身在服务端可能已经过汇总/截断，故口径是「与记录一致」，
+ * 不声称等同未处理的原始错误。nodeId 可回溯到工作树节点。
+ * source: "record" = 落盘消息字段；"history-summary" = 仅有结算摘要
+ * （过程事件未留存，如工具失败只有计数）。
+ */
+export type ConversationGraphProblemItem = {
+  id: string;
+  nodeId: string;
+  messageId: string;
+  kind: ConversationGraphProblemKind;
+  /** 失败阶段：run / route / tool。 */
+  stage: string;
+  errorCode?: string;
+  text: string;
+  source: "record" | "history-summary";
+  agentId?: AgentId;
+  agentLabel?: string;
+  createdAt: string;
+  completedAt?: string;
+};
+
+/** 同因簇：指纹 = 阶段 + 错误码 + 归一化触发文本（保守判同，见 conversation-problems）。 */
+export type ConversationGraphProblemCluster = {
+  id: string;
+  fingerprint: string;
+  kind: ConversationGraphProblemKind;
+  stage: string;
+  errorCode?: string;
+  itemIds: string[];
+};
+
+/**
+ * 问题台：由 graph DTO 纯派生（可关闭、失败可降级），不落盘、不作持久事实。
+ * truncated 表示条目/簇数触及上限被截断；dataIncomplete 表示历史只有结算
+ * 记录、过程事件未留存，数据不完整须在界面可见。
+ */
+export type ConversationGraphProblems = {
+  enabled: boolean;
+  /** 聚类派生失败时的降级标记：原图照常返回，问题台不可用。 */
+  degraded?: boolean;
+  items: ConversationGraphProblemItem[];
+  clusters: ConversationGraphProblemCluster[];
+  totalItems: number;
+  truncated: boolean;
+  dataIncomplete: boolean;
+};
+
+/** 自首次观测以来的会话段；受消息保留期（默认 90 天）限制，段界仅表示已观测 sessionId 切换。 */
+export type ConversationSessionSegment = {
+  type: "segment";
+  index: number;
+  sessionId: string;
+  sessionShortId: string;
+  startedAt: string;
+  lastActivityAt: string;
+  firstObservedAt: string;
+  userTurns: number;
+  runCount: number;
+  messageCount: number;
+  charCount: number;
+};
+
+/** 未记录 sessionId 的连续消息，不并入会话段汇总。 */
+export type ConversationSessionUnknownInterval = {
+  type: "unknown";
+  startedAt: string;
+  lastActivityAt: string;
+  messageCount: number;
+  charCount: number;
+};
+
+export type ConversationSessionBlock = ConversationSessionSegment | ConversationSessionUnknownInterval;
+
+export type ConversationAgentSessions = {
+  agentId: AgentId;
+  agentLabel?: string;
+  runtime?: string;
+  isSupervisor: boolean;
+  blocks: ConversationSessionBlock[];
+  segmentCount: number;
+  switchCount: number;
+  distinctSessionCount: number;
+  unknownIntervalCount: number;
+  unknownMessageCount: number;
+  totalUserTurns: number;
+  totalRuns: number;
+  totalMessages: number;
+  totalChars: number;
+};
+
+/** 只读派生，可关闭或降级；不推断会话重建，不设健康分或默认阈值。 */
+export type ConversationGraphSessions = {
+  enabled: boolean;
+  degraded?: boolean;
+  agents: ConversationAgentSessions[];
+  hasUnknownIntervals: boolean;
+};
+
+export type ConversationGraph = {
+  workspaceId: string;
+  conversationId: string;
+  generatedAt: string;
+  roots: ConversationGraphRoot[];
+  nodes: ConversationGraphNode[];
+  edges: ConversationGraphEdge[];
+  problems: ConversationGraphProblems;
+  sessions: ConversationGraphSessions;
 };
 
 export type MessageHistoryState = {
