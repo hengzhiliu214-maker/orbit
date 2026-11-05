@@ -315,6 +315,16 @@ export class AgentSession {
         ? (snapshot) => this.options.modelState!.update(snapshot)
         : undefined,
       onSessionCommands: (commands, sessionId) => this.rememberCommands(sessionId, commands),
+      onCompactionMarker: (info) => {
+        this.publish({
+          type: "run.compactionMarker",
+          conversationId: this.options.conversationId,
+          agentId: this.id,
+          runId,
+          sessionId: info.sessionId,
+          ...(info.messageId ? { messageId: info.messageId } : {}),
+        });
+      },
       requestPermission: (request) => this.requestPermission(runId, request),
       requestElicitation: (request) => this.requestElicitation(runId, request),
       onOutput: (text) => {

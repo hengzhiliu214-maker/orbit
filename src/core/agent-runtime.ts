@@ -59,6 +59,12 @@ export type AgentRuntimeRunOptions = {
    * `available_commands_update` 时携带完整命令列表与会话 ID。
    */
   onSessionCommands?: (commands: readonly AgentCommand[], sessionId: string) => void;
+  /**
+   * 已观测压缩标记回调（第三步试点）：运行时在主链分类点旁路观测到引擎的
+   * 压缩内部帧时调用，只携带元数据（会话/消息 id），不携带摘要正文。
+   * 仅接入的引擎定义会触发；回调抛错不得影响运行。
+   */
+  onCompactionMarker?: (info: { sessionId: string; messageId?: string }) => void;
 };
 
 export type AgentRuntimeRunHandle = {

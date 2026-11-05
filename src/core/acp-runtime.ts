@@ -146,6 +146,12 @@ export type AcpRuntimeDefinition = {
   envForRun?: (options: AcpRunOptions) => NodeJS.ProcessEnv;
   isDiagnosticMessage?: (update: SessionNotification["update"]) => boolean;
   classifyAnswerChunk?: (update: SessionNotification["update"]) => AcpAnswerChunkDisposition | undefined;
+  /**
+   * 该帧是否为引擎的压缩内部帧（与 classifyAnswerChunk 判 ignore 的口径一致）。
+   * 命中时共享层在丢弃前旁路通知 options.onCompactionMarker（只记元数据）；
+   * 分类结果不变，钩子位于回放守卫之后，只覆盖实时路径。
+   */
+  isCompactionMarkerChunk?: (update: SessionNotification["update"]) => boolean;
   /** 观察所有会话级更新帧，维护 runtime 特定的回合状态（如 CodeBuddy agentPhase 响应边界）。 */
   observeSessionUpdate?: (update: SessionNotification["update"], turn: AcpTurnState) => void;
   /**
@@ -1339,7 +1345,21 @@ function handleSessionUpdate(
       }
 
       const disposition = definition.classifyAnswerChunk?.(update) ?? "candidate";
-      if (disposition === "ignore") return;
+      if (disposition === "ignore") {
+        // 压缩标记旁路观测（第三步试点）：分类结果不变、仍整帧丢弃；钩子只记
+        // 元数据且抛错只吞掉，绝不影响主链。此处已在回放守卫之后，回放帧
+        // 不会到达这里，不会重复计数。
+        if (definition.isCompactionMarkerChunk?.(update)) {
+          try {
+            const messageId = getAgentMessageId(update);
+            options.onCompactionMarker?.({
+              sessionId: notification.sessionId,
+              ...(messageId ? { messageId } : {}),
+            });
+          } catch { /* 观测钩子失败不伤运行 */ }
+        }
+        return;
+      }
       if (turnState.awaitingResponseBoundary) {
         answerState.deferredChunks.push({ update: update as AgentTextUpdate, disposition });
         return;

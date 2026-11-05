@@ -18,6 +18,7 @@ import * as dagre from "@dagrejs/dagre";
 // 会让以 node:test 直接加载 App.tsx 的前端测试报 ERR_UNKNOWN_FILE_EXTENSION。
 
 import type {
+  ConversationAgentSessions,
   ConversationGraph,
   ConversationGraphCheckpoints,
   ConversationGraphNode,
@@ -467,6 +468,25 @@ function formatDateTime(iso: string): string {
   return Number.isNaN(date.getTime()) ? "" : date.toLocaleString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
 }
 
+type CompactionAgentState = "enabled" | "disabled" | "unsupported";
+
+/** 已观测压缩标记行（第三步试点）：只呈现观测事实，不出现「压缩次数」类措辞。 */
+function CompactionLine(props: { agent: ConversationAgentSessions; state?: CompactionAgentState }) {
+  const compaction = props.agent.compaction;
+  if (compaction) {
+    return <>
+      <div className="sessionSummary">已观测压缩标记 {compaction.markerSegmentCount} 段{compaction.unassignedSegmentCount > 0 ? <> · 未归段 {compaction.unassignedSegmentCount} 段</> : null}（同一回合内的相邻标记合并为一段；这只是观测到的标记，不是引擎报告的压缩事件）</div>
+      {compaction.segments.length > 0 ? <div className="sessionBlockList">{compaction.segments.map((segment, index) =>
+        <div className="sessionBlock" key={index}>标记段 · {formatDateTime(segment.startedAt)} · {segment.chunkCount} 个标记 chunk · {segment.assigned ? <>归入第 {segment.segmentIndex} 段</> : <>未归段</>}</div>)}
+      </div> : null}
+    </>;
+  }
+  if (props.state === "disabled") return <div className="sessionSummary">压缩标记：捕获未开启（CodeBuddy 试点，需 ORBIT_COMPACTION_CAPTURE 开启）</div>;
+  if (props.state === "unsupported") return <div className="sessionSummary">压缩标记：未接入 / 未验证</div>;
+  if (props.state === "enabled") return <div className="sessionSummary">已观测压缩标记：暂无覆盖记录</div>;
+  return null;
+}
+
 function SessionBoard(props: {
   graph: ConversationGraph | null;
   error: string | null;
@@ -486,6 +506,20 @@ function SessionBoard(props: {
     } catch { return ""; }
   });
   const budget = parseSessionBudget(budgetInput);
+  const [compactionStates, setCompactionStates] = useState<Map<string, CompactionAgentState>>(new Map());
+  useEffect(() => {
+    let cancelled = false;
+    const query = `workspaceId=${encodeURIComponent(props.workspaceId)}&conversationId=${encodeURIComponent(props.conversationId)}`;
+    void fetch(`/api/conversations/${encodeURIComponent(props.conversationId)}/engine-events/status?${query}`)
+      .then(async (response) => {
+        if (!response.ok) return;
+        const data = await response.json() as { agents?: { agentId: string; state: CompactionAgentState }[] };
+        if (cancelled || !Array.isArray(data.agents)) return;
+        setCompactionStates(new Map(data.agents.map((entry) => [entry.agentId, entry.state])));
+      })
+      .catch(() => { /* 状态端点不可用时不呈现捕获状态 */ });
+    return () => { cancelled = true; };
+  }, [props.workspaceId, props.conversationId]);
   const header = <>
     <div className="problemBoardHead">
       <span className="sessionBoardNote">按落盘消息派生，自首次观测以来；受消息保留期（默认 90 天）限制，更早的历史不可见。段按消息时间（createdAt，同刻按消息 id）排序切分。段界只记『已观测 sessionId 切换』，不等于已证实的会话重建。无 sessionId 的消息列入未知区间，不并入任何计数。</span>
@@ -513,6 +547,7 @@ function SessionBoard(props: {
   if (!sessions?.enabled) return <div className="sessionBoard">{header}<div className="graphEmpty">会话状态已关闭。</div>{checkpointSection}</div>;
   if (sessions.degraded) return <div className="sessionBoard">{header}<div className="graphEmpty">会话状态暂时不可用（统计已降级）。</div>{checkpointSection}</div>;
   return <div className="sessionBoard">{header}
+    {sessions.compactionCoverage ? <div className="sessionSummary">压缩标记覆盖区间 {sessions.compactionCoverage.intervals.length} 个{sessions.compactionCoverage.degraded ? <> · 覆盖存在缺口（事件记录含坏行）</> : null}{sessions.compactionCoverage.retentionExcluded ? <> · 部分早期事件已超 {sessions.compactionCoverage.retentionDays} 天留存窗口，未计入</> : null}</div> : null}
     {sessions.agents.length === 0 ? <div className="graphEmpty">本会话还没有员工执行记录。</div> : sessions.agents.map((agent) => {
       const lastSegment = agent.blocks.filter((block) => block.type === "segment").at(-1);
       const overBudget = budget !== null && lastSegment !== undefined && lastSegment.userTurns > budget;
@@ -525,6 +560,7 @@ function SessionBoard(props: {
         <div className="sessionSummary">已观测会话段 {agent.segmentCount} · 已观测切换 {agent.switchCount} 次 · 不同会话 {agent.distinctSessionCount} 个 · 用户轮次 {agent.totalUserTurns} · 执行 {agent.totalRuns} 次 · 消息 {agent.totalMessages} 条 · 共 {agent.totalChars} 字
           {agent.unknownIntervalCount > 0 ? <> · 未知区间 {agent.unknownIntervalCount} 处（{agent.unknownMessageCount} 条消息未记录 sessionId，未并入计数）</> : null}
         </div>
+        <CompactionLine agent={agent} state={compactionStates.get(agent.agentId)} />
         <div className="sessionBlockList">{agent.blocks.map((block, index) => block.type === "unknown" ?
           <div className="sessionBlock unknown" key={index}>未知区间 · {formatDateTime(block.startedAt)} – {formatDateTime(block.lastActivityAt)} · {block.messageCount} 条消息未记录 sessionId</div> :
           <div className="sessionBlock" key={index}>第 {block.index} 段 · 会话 <span className="sessionSegId" title={block.sessionId}>{block.sessionShortId}…</span> · 首次观测 {formatDateTime(block.firstObservedAt)} · 最近活动 {formatDateTime(block.lastActivityAt)} · 用户轮次 {block.userTurns} · 执行 {block.runCount} 次 · 消息 {block.messageCount} 条 · {block.charCount} 字

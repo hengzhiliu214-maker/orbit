@@ -639,6 +639,8 @@ export type ConversationAgentSessions = {
   totalRuns: number;
   totalMessages: number;
   totalChars: number;
+  /** 已观测压缩标记（第三步试点，仅捕获开启且该员工有标记段时出现）。 */
+  compaction?: ConversationAgentCompaction;
 };
 
 /** 只读派生，可关闭或降级；不推断会话重建，不设健康分或默认阈值。 */
@@ -647,6 +649,35 @@ export type ConversationGraphSessions = {
   degraded?: boolean;
   agents: ConversationAgentSessions[];
   hasUnknownIntervals: boolean;
+  /** 压缩标记捕获的覆盖信息（第三步试点，仅捕获开启时出现）。 */
+  compactionCoverage?: ConversationCompactionCoverage;
+};
+
+/** 一段已观测到的压缩标记（同 run 内相邻标记 chunk 的合并，只是观测分组，不是引擎报告的压缩事件）。 */
+export type ConversationCompactionSegment = {
+  sessionId?: string;
+  runId?: string;
+  startedAt: string;
+  endedAt: string;
+  chunkCount: number;
+  /** 是否唯一归入某个已观测会话段。 */
+  assigned: boolean;
+  segmentIndex?: number;
+};
+
+export type ConversationAgentCompaction = {
+  markerSegmentCount: number;
+  unassignedSegmentCount: number;
+  segments: ConversationCompactionSegment[];
+};
+
+export type ConversationCompactionCoverage = {
+  intervals: { from: string; to: string }[];
+  /** 事件文件存在坏行/部分尾行等缺口。 */
+  degraded: boolean;
+  /** 有事件因超出留存窗口被排除。 */
+  retentionExcluded: boolean;
+  retentionDays: number;
 };
 
 export type ConversationGraph = {
@@ -693,6 +724,7 @@ export type RuntimeEvent =
   | { type: "run.failed"; workspaceId?: string; conversationId: string; agentId: AgentId; runId: string; error: string; interactionMode?: InteractionMode }
   | { type: "run.cancelled"; workspaceId?: string; conversationId: string; agentId: AgentId; runId: string; resultMessageId: string }
   | { type: "run.sessionId"; workspaceId?: string; conversationId: string; agentId: AgentId; runId: string; sessionId: string }
+  | { type: "run.compactionMarker"; workspaceId?: string; conversationId: string; agentId: AgentId; runId: string; sessionId: string; messageId?: string }
   | { type: "permission.requested"; workspaceId?: string; conversationId: string; permission: PendingPermission }
   | { type: "permission.resolved"; workspaceId?: string; conversationId: string; requestId: string }
   | { type: "elicitation.requested"; workspaceId?: string; conversationId: string; elicitation: PendingElicitation }

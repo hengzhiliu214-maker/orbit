@@ -33,6 +33,14 @@ import {
   type ConversationSnapshot,
   type CheckpointManifest,
 } from "../core/conversation-checkpoints.ts";
+import {
+  appendEngineEvent,
+  buildCompactionDerivation,
+  compactionCaptureEnabled,
+  COMPACTION_PILOT_RUNTIME,
+  ENGINE_EVENTS_SCHEMA_VERSION,
+  readEngineEvents,
+} from "../core/engine-events.ts";
 import { probeAllRuntimes, runtimeKindToCliKey, type RuntimeProbeResult } from "../core/runtime-probe.ts";
 import type { AgentConfig } from "../core/agent-config-store.ts";
 import { WorkspaceConfigStore } from "../core/workspace-config-store.ts";
@@ -492,6 +500,7 @@ function getOrCreateContext(workspaceId: string, conversationId: string): Conver
   evictIfNeeded();
   const ctx = createContext(workspaceId, conversationId);
   contextMap.set(key, ctx);
+  noteCompactionCoverageStart(workspaceId, conversationId);
   touchLru(key);
   return ctx;
 }
@@ -805,6 +814,73 @@ async function withCheckpointLock<T>(key: string, fn: () => Promise<T>): Promise
   }
 }
 
+/**
+ * 压缩标记捕获的覆盖起点（第三步试点）：捕获开启时，每个会话在本进程内
+ * 首次被触及时记一条 coverage_start，派生层据此给出覆盖区间。落盘失败只
+ * 影响覆盖记录，绝不阻断上下文创建。
+ */
+const compactionCoverageStarted = new Set<string>();
+function noteCompactionCoverageStart(workspaceId: string, conversationId: string): void {
+  if (!compactionCaptureEnabled()) return;
+  const key = `${workspaceId}:${conversationId}`;
+  if (compactionCoverageStarted.has(key)) return;
+  compactionCoverageStarted.add(key);
+  try {
+    appendEngineEvent(workspaceStore.channelsDir(workspaceId, conversationId), {
+      kind: "coverage_start",
+      runtime: COMPACTION_PILOT_RUNTIME,
+      observedAt: new Date().toISOString(),
+      schemaVersion: ENGINE_EVENTS_SCHEMA_VERSION,
+    });
+  } catch { /* 旁路落盘失败不伤主链 */ }
+}
+
+/** 已观测压缩标记的落盘：AgentSession 经事件总线发来元数据，服务端在此落旁路文件。 */
+eventBus.subscribe((event) => {
+  if (event.type !== "run.compactionMarker") return;
+  if (!compactionCaptureEnabled()) return;
+  if (!event.workspaceId) return;
+  try {
+    appendEngineEvent(workspaceStore.channelsDir(event.workspaceId, event.conversationId), {
+      kind: "compaction_marker",
+      runtime: COMPACTION_PILOT_RUNTIME,
+      agentId: event.agentId,
+      runId: event.runId,
+      sessionId: event.sessionId,
+      ...(event.messageId ? { messageId: event.messageId } : {}),
+      observedAt: new Date().toISOString(),
+      schemaVersion: ENGINE_EVENTS_SCHEMA_VERSION,
+    });
+  } catch { /* 旁路落盘失败只置覆盖降级，绝不伤 run */ }
+});
+
+/**
+ * 把「已观测压缩标记」派生并入会话状态 DTO（第三步试点）。捕获关闭、会话
+ * 状态关闭或从未产生事件文件时不挂任何字段——DTO 与试点前逐字段一致。
+ * 派生失败只缺省，不拖垮 graph。
+ */
+function attachCompactionToGraph(graph: ConversationGraph, workspaceId: string, conversationId: string): void {
+  if (!graph.sessions.enabled || !compactionCaptureEnabled()) return;
+  try {
+    const read = readEngineEvents(workspaceStore.channelsDir(workspaceId, conversationId));
+    if (!read.exists) return;
+    const { coverage, byAgent } = buildCompactionDerivation({ read, agents: graph.sessions.agents });
+    graph.sessions.compactionCoverage = coverage;
+    for (const agent of graph.sessions.agents) {
+      // 事件文件里只会有试点引擎的标记（唯一生产者），按 agentId 挂载即可，
+      // 不依赖 DTO 里 runtime 是否在场（历史员工在冷进程下可能没有 runtime）。
+      const view = byAgent.get(agent.agentId);
+      if (view) {
+        agent.compaction = view;
+        continue;
+      }
+      if (agent.runtime === COMPACTION_PILOT_RUNTIME && coverage.intervals.length > 0) {
+        agent.compaction = { markerSegmentCount: 0, unassignedSegmentCount: 0, segments: [] };
+      }
+    }
+  } catch { /* 派生失败只缺省 */ }
+}
+
 function checkpointsBlockFor(workspaceId: string, conversationId: string, enabled: boolean): ConversationGraphCheckpoints {
   const writeEnabled = checkpointsWriteEnabled();
   if (!enabled) return emptyCheckpoints(false, writeEnabled, false, checkpointConfig);
@@ -937,6 +1013,16 @@ function reconcileHandoffOperationsAtStartup(): void {
 migrateChannelLayer();
 initActiveContext();
 reconcileHandoffOperationsAtStartup();
+// 第三步试点：捕获开启时，为既有会话补记压缩标记覆盖起点（每进程每会话一次）。
+if (compactionCaptureEnabled()) {
+  try {
+    for (const workspace of workspaceStore.list()) {
+      for (const conversation of conversationStoreFor(workspace.id).list(workspace.id)) {
+        noteCompactionCoverageStart(workspace.id, conversation.id);
+      }
+    }
+  } catch { /* 覆盖起点补记失败不阻断启动 */ }
+}
 runHistoryCleanup();
 runAttachmentDraftCleanup();
 
@@ -1124,7 +1210,7 @@ const server = http.createServer(async (req, res) => {
         agentLabels.set(agentState.id, agentState.label);
         agentRuntimes.set(agentState.id, agentState.runtime);
       }
-      sendJson(res, 200, buildConversationGraph({
+      const graphDto = buildConversationGraph({
         workspaceId: target.workspaceId,
         conversationId: convId,
         messages: projected,
@@ -1133,10 +1219,34 @@ const server = http.createServer(async (req, res) => {
         includeProblems,
         includeSessions,
         checkpoints: checkpointsBlockFor(target.workspaceId, convId, includeCheckpoints),
-      }));
+      });
+      attachCompactionToGraph(graphDto, target.workspaceId, convId);
+      sendJson(res, 200, graphDto);
       return;
     }
 
+
+    // 压缩标记捕获状态（第三步试点）：供「会话状态」页签呈现开关与接入状态。
+    if (req.method === "GET" && url.pathname.startsWith("/api/conversations/") && url.pathname.endsWith("/engine-events/status")) {
+      const parts = url.pathname.split("/");
+      const convId = parts[3];
+      const target = convId ? resolveTarget(url) : null;
+      if (!convId || !target || target.conversationId !== convId) {
+        sendJson(res, 409, { ok: false, message: "workspaceId and conversationId are required." });
+        return;
+      }
+      const captureEnabled = compactionCaptureEnabled();
+      const ctx = contextForTarget(target);
+      const agents = ctx ? ctx.agents.states().map((state) => ({
+        agentId: state.id,
+        runtime: state.runtime,
+        state: state.runtime === COMPACTION_PILOT_RUNTIME
+          ? (captureEnabled ? "enabled" : "disabled")
+          : "unsupported",
+      })) : [];
+      sendJson(res, 200, { ok: true, captureEnabled, pilotRuntime: COMPACTION_PILOT_RUNTIME, agents });
+      return;
+    }
 
     // 检查点（第二步 v1）：生成 / 删除 / 交接预览 / 交接。写端点组有独立
     // 开关，关闭时服务端直接拒绝写操作；只读聚合走 graph DTO 的旁路块。
