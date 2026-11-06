@@ -5,7 +5,7 @@ import { clampPreviewWidth, PREVIEW_DEFAULT_WIDTH } from "./file-preview.ts";
 import { isSafeExternalUrl } from "./url-guard.ts";
 import { AGENT_RUNTIME_PRIORITY, runtimeKindToCliKey, runtimeMeta } from "../core/runtime-meta.ts";
 import { INTERNAL_SUPERVISOR_ID } from "../core/agent-profiles.ts";
-import { matchAssignmentPrefix } from "../core/mention-router.ts";
+import { matchAssignmentPrefix, routeMention } from "../core/mention-router.ts";
 import { resolveSlashCommandTarget } from "../core/native-commands.ts";
 import { matchPreset } from "../core/workspace-presets.ts";
 import { type AgentActivityEvent, type AgentCommand, type AgentCommandsSnapshot, type AgentConfig, type AgentConfigWithModelState, type AgentId, type AgentModelChoice, type AgentModelPreference, type AgentModelProbeResponse, type AgentModelProbeState, type AgentModelStateSnapshot, type AgentPlanSnapshot, type AgentRuntimeKind, type AgentState, type AgentTeamTemplate, type AppState, type ApprovalMode, type ChatMessage, type Conversation, type ConversationInfo, type DraftAttachmentInfo, type ElicitationContent, type ElicitationFieldSchema, type ElicitationResponse, type InteractionMode, type MessagePage, type PendingElicitation, type PendingPermission, type PermissionDecision, type PersistedProcessTimelineEntry, type RunningSummary, type RuntimeEvent, type SupervisorConfig, type Workspace, type WorkspacePreset, ATTACHMENT_LIMITS } from "../shared/types.ts";
@@ -998,6 +998,21 @@ export function App() {
         setContent("");
         scheduleComposerResize();
         setPendingAttachments([]);
+        // 同步默认接收人：服务端已按本次指派更新 lastDirectAgentId，
+        // 客户端不跟进的话，同页内 "/" 菜单与占位提示会长期停留在旧值。
+        const syncedLastDirectAgentId = resolveSyncedLastDirectAgentId(
+          trimmed,
+          interactionMode,
+          state.agents,
+          state.conversation.lastDirectAgentId,
+          pendingAttachments.length > 0,
+        );
+        if (syncedLastDirectAgentId !== state.conversation.lastDirectAgentId) {
+          setState((current) => ({
+            ...current,
+            conversation: { ...current.conversation, lastDirectAgentId: syncedLastDirectAgentId },
+          }));
+        }
         lifecycle.clearSlots(sendContext);
         isNearBottomRef.current = true;
         setIsNearBottom(true);
@@ -4813,6 +4828,34 @@ export function applyEvent(state: AppState, event: RuntimeEvent): AppState {
   }
 
   return state;
+}
+
+/**
+ * 发送成功后同步默认接收人（Dot 0140 补测发现）。
+ *
+ * 服务端在直接对话模式下、消息实际指派给唯一一位员工时才更新
+ * lastDirectAgentId（message-router 经 routeMention 判定；无 @ 沿用
+ * 既有值、指派不明/多人被拦截时均不变）。客户端的会话对象只在整量
+ * 刷新时才更新，因此同页内刚发完 @消息、紧接着输入 "/" 时，斜杠菜单
+ * 的目标仍是旧值（新会话里直接打不开）。这里按同一判定函数镜像推导，
+ * 只在确实会变化时返回新值；其余情况返回原值，不写状态。
+ */
+export function resolveSyncedLastDirectAgentId(
+  content: string,
+  interactionMode: InteractionMode,
+  agents: readonly AgentState[],
+  currentLastDirectAgentId: AgentId | undefined,
+  hasAttachments: boolean,
+): AgentId | undefined {
+  if (interactionMode !== "direct") return currentLastDirectAgentId;
+  const result = routeMention(
+    content,
+    agents.map((agent) => ({ id: agent.id, name: agent.label, runtime: agent.runtime, cwd: "", systemPrompt: "" })),
+    undefined,
+    { allowEmptyAssignment: hasAttachments },
+  );
+  if (result.kind !== "assignments" || result.agentIds.length !== 1) return currentLastDirectAgentId;
+  return result.agentIds[0];
 }
 
 export function upsertMessage(
