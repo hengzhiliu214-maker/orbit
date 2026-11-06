@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Background,
   Controls,
@@ -737,7 +737,7 @@ function CheckpointSection(props: {
   </section>;
 }
 
-export function GraphPanel(props: {
+function GraphPanelView(props: {
   workspaceId: string;
   conversationId: string;
   /** 会话消息签名：变化即（防抖后）重拉导图数据，跟随实时执行。 */
@@ -924,3 +924,8 @@ export function GraphPanel(props: {
     </aside>
   );
 }
+
+// P1 第一步：面板 memo 隔离。调用方（App）保证 props 引用稳定
+// （字符串 props 按值比较、回调 useCallback 化），草稿输入不再让
+// 面板与画布随每次按键重渲染；liveSignature 真变化时照常更新。
+export const GraphPanel = memo(GraphPanelView);

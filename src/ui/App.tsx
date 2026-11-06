@@ -1,4 +1,4 @@
-import { CSSProperties, FormEvent, KeyboardEvent, MouseEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { CSSProperties, FormEvent, KeyboardEvent, MouseEvent, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { renderMarkdown, LOCAL_PATH_LINK_CLASS } from "./markdown-renderer.ts";
 import { clampPreviewWidth, PREVIEW_DEFAULT_WIDTH } from "./file-preview.ts";
 import { isSafeExternalUrl } from "./url-guard.ts";
@@ -179,6 +179,31 @@ export function App() {
   const messagesRef = useRef<HTMLDivElement | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  // 输入框高度重算按帧合并（P1 第一步）：旧实现每次 onChange 同步写
+  // height:auto 再读 scrollHeight 写回，基线实测单字约 4.3ms 强制布局
+  // 成本。改为同一帧内多次输入只测一次；内容被程序化改动（发送清空、
+  // 插入提及/命令、切换员工）时也走同一入口，保证高度最终与内容一致。
+  const composerResizeFrameRef = useRef<number | null>(null);
+  const scheduleComposerResize = useCallback(() => {
+    if (composerResizeFrameRef.current !== null) {
+      return;
+    }
+    composerResizeFrameRef.current = window.requestAnimationFrame(() => {
+      composerResizeFrameRef.current = null;
+      const element = inputRef.current;
+      if (!element) {
+        return;
+      }
+      element.style.height = "auto";
+      element.style.height = `${Math.min(element.scrollHeight, 22 * 6)}px`;
+    });
+  }, []);
+  useEffect(() => () => {
+    if (composerResizeFrameRef.current !== null) {
+      window.cancelAnimationFrame(composerResizeFrameRef.current);
+      composerResizeFrameRef.current = null;
+    }
+  }, []);
   const [isNearBottom, setIsNearBottom] = useState(true);
   const [showNewMessageHint, setShowNewMessageHint] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -522,6 +547,16 @@ export function App() {
     }
     return `${state.conversation.id}:${hash}`;
   }, [state.messages, state.conversation.id]);
+  // GraphPanel 回调 props 引用稳定（P1 第一步 memo 隔离）：定位消息走
+  // ref 转发最新实现，避免内联箭头函数让面板随每次输入重渲染。
+  const revealMessageRef = useRef(revealMessage);
+  revealMessageRef.current = revealMessage;
+  const handleGraphLocateMessage = useCallback((messageId: string) => {
+    void revealMessageRef.current(messageId);
+  }, []);
+  const handleGraphPanelClose = useCallback(() => {
+    setGraphPanelVisible(false);
+  }, []);
   const agentIds = useMemo(() => state.agents.map((agent) => agent.id), [state.agents]);
   const hasEnabledAgent = agentIds.length > 0;
   const interactionMode: InteractionMode = state.conversation.interactionMode ?? "direct";
@@ -958,6 +993,7 @@ export function App() {
       if (!lifecycle.isStale(sendContext)) {
         draftMessageIdRef.current = null;
         setContent("");
+        scheduleComposerResize();
         setPendingAttachments([]);
         lifecycle.clearSlots(sendContext);
         isNearBottomRef.current = true;
@@ -1517,6 +1553,7 @@ export function App() {
     });
     const nextCursorIndex = agentName.length + 3;
     setCursorIndex(nextCursorIndex);
+    scheduleComposerResize();
     window.setTimeout(() => {
       inputRef.current?.focus();
       if (!content.trim() || /^@[^\s@:：]+:\s*$/.test(content.trim())) {
@@ -1776,6 +1813,7 @@ export function App() {
     setSelectedAgent(agentId);
     setContent(nextContent);
     setCursorIndex(nextCursorIndex);
+    scheduleComposerResize();
     window.setTimeout(() => {
       inputRef.current?.focus();
       inputRef.current?.setSelectionRange(nextCursorIndex, nextCursorIndex);
@@ -1792,6 +1830,7 @@ export function App() {
     const nextCursorIndex = slashCommandDraft.start + command.name.length + 2;
     setContent(nextContent);
     setCursorIndex(nextCursorIndex);
+    scheduleComposerResize();
     window.setTimeout(() => {
       inputRef.current?.focus();
       inputRef.current?.setSelectionRange(nextCursorIndex, nextCursorIndex);
@@ -2343,10 +2382,7 @@ export function App() {
               onChange={(event) => {
                 setContent(event.target.value);
                 setCursorIndex(event.target.selectionStart ?? event.target.value.length);
-                event.target.style.height = "auto";
-                const maxRows = 6;
-                const lineHeight = 22;
-                event.target.style.height = `${Math.min(event.target.scrollHeight, lineHeight * maxRows)}px`;
+                scheduleComposerResize();
               }}
               onClick={updateCursorFromInput}
               onFocus={(event) => {
@@ -2559,8 +2595,8 @@ export function App() {
           liveSignature={graphLiveSignature}
           onSessionsIssueChange={setSessionDataIssue}
           overlay={isCompactViewport}
-          onLocateMessage={(messageId) => { void revealMessage(messageId); }}
-          onClose={() => setGraphPanelVisible(false)}
+          onLocateMessage={handleGraphLocateMessage}
+          onClose={handleGraphPanelClose}
         />
       ) : null}
       {previewPath ? (
@@ -3045,7 +3081,7 @@ function AgentButton(props: { agent: AgentState; selected: boolean; showLiveStat
   );
 }
 
-function MessageRow({
+function MessageRowBase({
   message,
   agent,
   parentMessage,
@@ -3206,6 +3242,11 @@ function MessageRow({
     </article>
   );
 }
+
+// P1 第一步：消息行 memo 隔离。props 均为引用稳定来源（消息对象只以
+// 不可变方式更新、agentsById/messagesById 按依赖 memo），打字时草稿
+// 状态变化不再让全量消息行重画；某条消息自身变化时仍照常重渲染。
+const MessageRow = memo(MessageRowBase);
 
 type ProcessTimelineEntry =
   | { kind: "text"; text: string; timestamp: string; stream: "progress" | "answer"; isFinal?: boolean }
