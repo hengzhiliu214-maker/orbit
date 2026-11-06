@@ -1,4 +1,12 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { GraphFetchGeneration, GraphRefreshScheduler, type GraphRefreshReason } from "./graph-refresh-scheduler.ts";
+import {
+  loadGraphSelection,
+  resolveRestoredSelection,
+  resolveSelectionOnSnapshot,
+  saveGraphSelection,
+  type GraphSelection,
+} from "./graph-selection-storage.ts";
 import {
   Background,
   Controls,
@@ -26,6 +34,7 @@ import type {
   ConversationGraphNodeType,
   ConversationGraphProblemItem,
   ConversationGraphProblemKind,
+  ConversationGraphRoot,
 } from "../shared/types.ts";
 
 const NODE_WIDTH = 216;
@@ -44,6 +53,18 @@ const NODE_TYPE_LABELS: Record<ConversationGraphNodeType, string> = {
   instruction: "指令",
   execution: "执行",
   conclusion: "结论",
+};
+
+const ROOT_STATUS_LABELS: Record<ConversationGraphRoot["status"], string> = {
+  ...STATUS_LABELS,
+  idle: "未开始",
+};
+
+/** 面板头刷新原因口径（0136 第四节）：只认这三种，不编造。 */
+const REFRESH_REASON_LABELS: Record<GraphRefreshReason, string> = {
+  open: "打开",
+  live: "消息变化（已合并）",
+  manual: "手动",
 };
 
 const PROBLEM_KIND_LABELS: Record<ConversationGraphProblemKind, string> = {
@@ -142,14 +163,26 @@ function layoutWithDagre(nodeIds: string[], edges: { source: string; target: str
   return positions;
 }
 
+export type GraphRootVisibility = {
+  /** 当前根下节点总数（含折叠）。 */
+  total: number;
+  /** 画布上实际显示的节点数。 */
+  visible: number;
+  /** 被折叠（子树折叠 / 重试折叠）隐藏的节点数。 */
+  hidden: number;
+};
+
 function GraphCanvas(props: {
   graph: ConversationGraph;
   selectedRootId: string;
   onLocateMessage: (messageId: string) => void;
+  /** 当前根可见节点数变化时回報面板（P2b：折叠数与总数分开标注）。 */
+  onVisibilityChange?: (counts: GraphRootVisibility) => void;
 }) {
   const { graph, selectedRootId } = props;
   const [collapsedIds, setCollapsedIds] = useState<ReadonlySet<string>>(new Set());
   const [expandedRetryGroups, setExpandedRetryGroups] = useState<ReadonlySet<string>>(new Set());
+  const visibilityRef = useRef<GraphRootVisibility>({ total: -1, visible: -1, hidden: -1 });
 
   const toggleRetry = useCallback((groupId: string) => {
     setExpandedRetryGroups((current) => {
@@ -172,6 +205,7 @@ function GraphCanvas(props: {
     positionsRef.current.clear();
     structureKeyRef.current = "";
     fittedRootRef.current = "";
+    visibilityRef.current = { total: -1, visible: -1, hidden: -1 };
   }, [graph.conversationId]);
 
   const toggleCollapse = useCallback((nodeId: string) => {
@@ -215,11 +249,18 @@ function GraphCanvas(props: {
     const visibleEdges = graph.edges.filter(
       (edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target),
     );
-    return { visibleNodes, visibleEdges };
+    return { visibleNodes, visibleEdges, total: members.length };
   }, [graph, selectedRootId, collapsedIds, expandedRetryGroups]);
 
   useEffect(() => {
-    const { visibleNodes, visibleEdges } = visible;
+    const { visibleNodes, visibleEdges, total } = visible;
+    // 折叠数与总数分开上报：变化时才回调，避免父子渲染循环。
+    const counts: GraphRootVisibility = { total, visible: visibleNodes.length, hidden: total - visibleNodes.length };
+    const previous = visibilityRef.current;
+    if (previous.total !== counts.total || previous.visible !== counts.visible || previous.hidden !== counts.hidden) {
+      visibilityRef.current = counts;
+      props.onVisibilityChange?.(counts);
+    }
     const nodesById = new Map(graph.nodes.map((node) => [node.id, node]));
     // 结构键：节点/边集合不变（仅状态变化）时不重排，位置完全复用，避免实时刷新时图面跳动。
     const structureKey = [
@@ -273,7 +314,7 @@ function GraphCanvas(props: {
       }, 60);
       return () => window.clearTimeout(timer);
     }
-  }, [visible, graph.nodes, selectedRootId, collapsedIds, toggleCollapse, expandedRetryGroups, toggleRetry, reactFlow, setFlowNodes, setFlowEdges]);
+  }, [visible, graph.nodes, selectedRootId, collapsedIds, toggleCollapse, expandedRetryGroups, toggleRetry, reactFlow, setFlowNodes, setFlowEdges, props.onVisibilityChange]);
 
   if (graph.roots.length === 0) {
     return <div className="graphEmpty">本会话还没有任务链。发出一条指派消息后，这里会长出工作树。</div>;
@@ -750,79 +791,216 @@ function GraphPanelView(props: {
   const [graph, setGraph] = useState<ConversationGraph | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedRootId, setSelectedRootId] = useState<string>("");
+  const [followLatest, setFollowLatestState] = useState(true);
   const [activeTab, setActiveTab] = useState<"tree" | "problems" | "sessions">("tree");
   const [problemsEnabled, setProblemsEnabled] = useState(true);
   const [sessionsEnabled, setSessionsEnabled] = useState(true);
   const [checkpointsEnabled, setCheckpointsEnabled] = useState(true);
+  const [lastRefresh, setLastRefresh] = useState<{ generatedAt: string; reason: GraphRefreshReason } | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [rootNotice, setRootNotice] = useState<string | null>(null);
+  const [rootVisibility, setRootVisibility] = useState<GraphRootVisibility | null>(null);
   const issueRef = useRef(false);
   const issueCallbackRef = useRef(props.onSessionsIssueChange);
   issueCallbackRef.current = props.onSessionsIssueChange;
   const followLatestRef = useRef(true);
   const graphRef = useRef<ConversationGraph | null>(null);
   graphRef.current = graph;
+  // 选中根只走 applySelection 这一处写 ref + state，避免渲染时回写
+  // 旧 state 把刚落盘的选择覆盖掉（双窗口/并发取回下尤其要紧）。
+  const selectedRootRef = useRef("");
+  const generationRef = useRef(new GraphFetchGeneration());
+  const fetchControllerRef = useRef<AbortController | null>(null);
+  const restoredRef = useRef(false);
+  const storedSelectionRef = useRef<GraphSelection | null>(null);
+  const skipNextLiveEffectRef = useRef(true);
+  const firstOptionsRunRef = useRef(true);
+  const workspaceIdRef = useRef(props.workspaceId);
+  const conversationIdRef = useRef(props.conversationId);
+  const optionsRef = useRef({ problemsEnabled, sessionsEnabled, checkpointsEnabled });
+  optionsRef.current = { problemsEnabled, sessionsEnabled, checkpointsEnabled };
 
-  const fetchGraph = useCallback(async (signal: AbortSignal) => {
-    if (!props.workspaceId || !props.conversationId) return;
-    const query = new URLSearchParams({ workspaceId: props.workspaceId, conversationId: props.conversationId });
-    if (!problemsEnabled) query.set("problems", "0");
-    if (!sessionsEnabled) query.set("sessions", "0");
-    if (!checkpointsEnabled) query.set("checkpoints", "0");
-    const response = await fetch(
-      `/api/conversations/${encodeURIComponent(props.conversationId)}/graph?${query.toString()}`,
-      { signal },
-    );
-    if (!response.ok) throw new Error(`Graph request failed: ${response.status}`);
-    const data = (await response.json()) as ConversationGraph;
-    if (signal.aborted) return;
-    setGraph(data);
-    setError(null);
-    setSelectedRootId((current) => {
-      const latest = data.roots.at(-1)?.id ?? "";
-      if (!current || followLatestRef.current || !data.roots.some((root) => root.id === current)) {
-        followLatestRef.current = true;
-        return latest;
-      }
-      return current;
+  const applyFollow = useCallback((value: boolean) => {
+    followLatestRef.current = value;
+    setFollowLatestState(value);
+  }, []);
+
+  const applySelection = useCallback((rootId: string) => {
+    selectedRootRef.current = rootId;
+    setSelectedRootId(rootId);
+  }, []);
+
+  const persistSelection = useCallback((selection: GraphSelection) => {
+    try {
+      saveGraphSelection(window.localStorage, props.workspaceId, props.conversationId, selection);
+    } catch {
+      // 存储不可用时仅本次会话内生效。
+    }
+  }, [props.workspaceId, props.conversationId]);
+
+  // 调度器实例在面板生命周期内唯一；取回回调走 ref，永远调最新的
+  // startFetch（会话切换后不让旧闭包把旧会话快照落盘）。
+  const startFetchRef = useRef<(reason: GraphRefreshReason) => Promise<void>>(async () => {});
+  const schedulerRef = useRef<GraphRefreshScheduler | null>(null);
+  if (schedulerRef.current === null) {
+    schedulerRef.current = new GraphRefreshScheduler((reason) => {
+      void startFetchRef.current(reason);
     });
-  }, [props.workspaceId, props.conversationId, problemsEnabled, sessionsEnabled, checkpointsEnabled]);
+  }
+
+  const startFetch = useCallback(async (reason: GraphRefreshReason) => {
+    const workspaceId = props.workspaceId;
+    const conversationId = props.conversationId;
+    if (!workspaceId || !conversationId) return;
+    // 单次在途：打断上一请求；代次保护：旧响应晚到不得落盘。
+    fetchControllerRef.current?.abort();
+    const controller = new AbortController();
+    fetchControllerRef.current = controller;
+    const generation = generationRef.current.next();
+    const token = schedulerRef.current!.onFetchStarted();
+    setRefreshing(true);
+    try {
+      const query = new URLSearchParams({ workspaceId, conversationId });
+      const options = optionsRef.current;
+      if (!options.problemsEnabled) query.set("problems", "0");
+      if (!options.sessionsEnabled) query.set("sessions", "0");
+      if (!options.checkpointsEnabled) query.set("checkpoints", "0");
+      const response = await fetch(
+        `/api/conversations/${encodeURIComponent(conversationId)}/graph?${query.toString()}`,
+        { signal: controller.signal },
+      );
+      if (!response.ok) throw new Error(`Graph request failed: ${response.status}`);
+      const data = (await response.json()) as ConversationGraph;
+      if (controller.signal.aborted || !generationRef.current.isCurrent(generation)) return;
+      // 只认当前会话的快照：切换会话后晚到的旧会话响应不得落盘。
+      if (workspaceId !== workspaceIdRef.current || conversationId !== conversationIdRef.current) return;
+      setGraph(data);
+      setError(null);
+      setRefreshError(null);
+      setLastRefresh({ generatedAt: data.generatedAt, reason });
+      // 选中根决议（P2a）：恢复只在首次成功拿到完整图后做一次；
+      // 之后每次成功快照按跟随开关决议；空图不消费、不清 stored。
+      if (!restoredRef.current) {
+        const resolved = resolveRestoredSelection(storedSelectionRef.current, data.roots);
+        if (resolved) {
+          restoredRef.current = true;
+          applyFollow(resolved.followLatest);
+          applySelection(resolved.rootId);
+          if (resolved.missingStoredRoot) {
+            setRootNotice("上次看的根任务已不在最新快照中，已切换到最新根。");
+            persistSelection({ rootId: resolved.rootId, followLatest: resolved.followLatest });
+          }
+        }
+      } else {
+        const resolved = resolveSelectionOnSnapshot(selectedRootRef.current, followLatestRef.current, data.roots);
+        if (resolved) {
+          if (resolved.rootId !== selectedRootRef.current) applySelection(resolved.rootId);
+          if (resolved.missingStoredRoot) {
+            setRootNotice("之前看的根任务已不在最新快照中，已切换到最新根。");
+            persistSelection({ rootId: resolved.rootId, followLatest: resolved.followLatest });
+          }
+        }
+      }
+    } catch (fetchError: unknown) {
+      if ((fetchError as { name?: string }).name === "AbortError") return;
+      if (!generationRef.current.isCurrent(generation)) return;
+      if (!graphRef.current) setError("指令链暂时无法加载");
+      else setRefreshError("刷新失败，已保留上一份图。");
+    } finally {
+      schedulerRef.current!.onFetchSettled(token);
+      if (generationRef.current.isCurrent(generation)) setRefreshing(false);
+    }
+  }, [props.workspaceId, props.conversationId, applyFollow, applySelection, persistSelection]);
+  startFetchRef.current = startFetch;
 
   const refreshGraph = useCallback(() => {
-    const controller = new AbortController();
-    fetchGraph(controller.signal).catch(() => {
-      // 操作后的刷新失败时保留上一份图，下一次实时事件会再试。
-    });
-  }, [fetchGraph]);
+    schedulerRef.current?.requestImmediate("manual");
+  }, []);
 
-  useEffect(() => {
-    const controller = new AbortController();
-    fetchGraph(controller.signal).catch((reason: unknown) => {
-      if ((reason as { name?: string }).name !== "AbortError" && !graphRef.current) {
-        setError("指令链暂时无法加载");
-      }
-    });
-    return () => controller.abort();
-  }, [fetchGraph]);
+  const handleSelectRoot = useCallback((rootId: string) => {
+    // 手选任一根即关跟随，永不因“恰好在看最新根”自动重开。
+    applyFollow(false);
+    applySelection(rootId);
+    setRootNotice(null);
+    setRootVisibility(null);
+    persistSelection({ rootId, followLatest: false });
+  }, [applyFollow, applySelection, persistSelection]);
 
-  useEffect(() => {
-    if (!props.liveSignature) return;
-    const controller = new AbortController();
-    const timer = window.setTimeout(() => {
-      fetchGraph(controller.signal).catch(() => {
-        // 实时刷新失败时保留上一份图，不打断观看；下一次事件会再试。
-      });
-    }, 450);
-    return () => {
-      window.clearTimeout(timer);
-      controller.abort();
-    };
-  }, [props.liveSignature, fetchGraph]);
+  const handleFollowToggle = useCallback((checked: boolean) => {
+    applyFollow(checked);
+    const latestRootId = graphRef.current?.roots.at(-1)?.id ?? "";
+    const rootId = checked && latestRootId ? latestRootId : selectedRootRef.current;
+    if (checked && latestRootId && latestRootId !== selectedRootRef.current) applySelection(latestRootId);
+    persistSelection({ rootId, followLatest: checked });
+  }, [applyFollow, applySelection, persistSelection]);
 
+  const handleManualRefresh = useCallback(() => {
+    schedulerRef.current?.requestImmediate("manual");
+  }, []);
+
+  const handleVisibilityChange = useCallback((counts: GraphRootVisibility) => {
+    setRootVisibility((current) =>
+      current && current.total === counts.total && current.visible === counts.visible && current.hidden === counts.hidden
+        ? current
+        : counts,
+    );
+  }, []);
+
+  // 切换工作区/会话（与首次挂载）：读 stored 供本次打开恢复，重置内存
+  // 选择与刷新口径，随即以“打开”原因取一次完整图。恢复决议不在这里
+  // 做——要等这次取回成功拿到完整图后才在 startFetch 里做。
   useEffect(() => {
-    followLatestRef.current = true;
+    workspaceIdRef.current = props.workspaceId;
+    conversationIdRef.current = props.conversationId;
+    let stored: GraphSelection | null = null;
+    try {
+      stored = loadGraphSelection(window.localStorage, props.workspaceId, props.conversationId);
+    } catch {
+      stored = null;
+    }
+    storedSelectionRef.current = stored;
+    restoredRef.current = false;
+    applyFollow(stored?.followLatest ?? true);
+    selectedRootRef.current = "";
     setSelectedRootId("");
     setGraph(null);
+    setError(null);
+    setRefreshError(null);
+    setRootNotice(null);
+    setLastRefresh(null);
+    setRootVisibility(null);
     setActiveTab("tree");
-  }, [props.conversationId]);
+    skipNextLiveEffectRef.current = true;
+    schedulerRef.current?.requestImmediate("open");
+  }, [props.workspaceId, props.conversationId, applyFollow]);
+
+  // 会话消息签名变化即调度刷新（调度器：450ms 尾沿 + 1000ms 最大等待 +
+  // 连续变化期间最多每 1000ms 取一次 + 最终补刷，单次在途）。
+  // 紧跟打开取回的那一次签名变化跳过，避免重复取。
+  useEffect(() => {
+    if (!props.liveSignature) return;
+    if (skipNextLiveEffectRef.current) {
+      skipNextLiveEffectRef.current = false;
+      return;
+    }
+    schedulerRef.current?.onInputChanged();
+  }, [props.liveSignature]);
+
+  // 面板选项（问题台/会话状态/检查点）开关后重拉：属于用户手动操作。
+  useEffect(() => {
+    if (firstOptionsRunRef.current) {
+      firstOptionsRunRef.current = false;
+      return;
+    }
+    schedulerRef.current?.requestImmediate("manual");
+  }, [problemsEnabled, sessionsEnabled, checkpointsEnabled]);
+
+  // 卸载时停掉调度器与在途请求。
+  useEffect(() => () => {
+    schedulerRef.current?.dispose();
+    fetchControllerRef.current?.abort();
+  }, []);
 
   useEffect(() => {
     const sessions = graph?.conversationId === props.conversationId ? graph.sessions : undefined;
@@ -839,6 +1017,7 @@ function GraphPanelView(props: {
   }, [props.conversationId]);
 
   const roots = graph?.roots ?? [];
+  const latestRootId = roots.at(-1)?.id ?? "";
   return (
     <aside className={`graphPanel${props.overlay ? " overlay" : ""}`} aria-label="指令链工作树">
       <header className="graphPanelHeader">
@@ -850,6 +1029,27 @@ function GraphPanelView(props: {
           ×
         </button>
       </header>
+      <div className="graphPanelMeta">
+        <span>根任务 {roots.length} 个</span>
+        {lastRefresh ? (
+          <span>快照生成于 {formatDateTime(lastRefresh.generatedAt)} · {REFRESH_REASON_LABELS[lastRefresh.reason]}</span>
+        ) : (
+          <span>尚未刷新</span>
+        )}
+        {refreshing ? <span className="graphRefreshing">刷新中…</span> : null}
+        <button type="button" className="graphRefreshBtn" onClick={handleManualRefresh} title="重新拉取最新快照">
+          手动刷新
+        </button>
+      </div>
+      {refreshError ? <div className="graphRefreshError">{refreshError}</div> : null}
+      {rootNotice ? (
+        <div className="graphRootNotice" role="status">
+          <span>{rootNotice}</span>
+          <button type="button" onClick={() => setRootNotice(null)} aria-label="关闭提示">
+            ×
+          </button>
+        </div>
+      ) : null}
       <div className="graphTabs" role="tablist" aria-label="指令链面板页签">
         <button
           type="button"
@@ -887,33 +1087,64 @@ function GraphPanelView(props: {
           onLocateMessage={props.onLocateMessage}
         />
       ) : null}
-      {activeTab === "tree" && roots.length > 1 ? (
-        <div className="graphRootBar" role="tablist" aria-label="选择根任务">
-          {roots.map((root) => (
-            <button
-              key={root.id}
-              type="button"
-              role="tab"
-              aria-selected={root.id === selectedRootId}
-              className={`graphRootChip ${root.id === selectedRootId ? "active" : ""}`}
-              title={root.title}
-              onClick={() => {
-                followLatestRef.current = root.id === roots.at(-1)?.id;
-                setSelectedRootId(root.id);
-              }}
-            >
-              <span className={`graphStatusDot ${root.status}`} aria-hidden="true" />
-              <span className="graphRootChipTitle">{root.title}</span>
-            </button>
-          ))}
+      {activeTab === "tree" ? (
+        <div className="graphRootHistory">
+          <div className="graphRootHistoryHead">
+            <strong>根任务历史（{roots.length} 个）</strong>
+            <label className="graphFollowToggle" title="打开后新根到达时自动跳到最新根；手选任一根即关闭">
+              <input
+                type="checkbox"
+                checked={followLatest}
+                onChange={(event) => handleFollowToggle(event.target.checked)}
+              />
+              跟随最新
+            </label>
+          </div>
+          {graph === null ? (
+            <div className="graphEmpty">{error ?? "加载中…"}</div>
+          ) : roots.length === 0 ? (
+            <div className="graphEmpty">本会话还没有根任务。</div>
+          ) : (
+            <ul className="graphRootList">
+              {[...roots].reverse().map((root) => (
+                <li key={root.id}>
+                  <button
+                    type="button"
+                    aria-current={root.id === selectedRootId}
+                    className={`graphRootItem${root.id === selectedRootId ? " active" : ""}`}
+                    title={root.title}
+                    onClick={() => handleSelectRoot(root.id)}
+                  >
+                    <span className={`graphStatusDot ${root.status}`} aria-hidden="true" />
+                    <span className="graphRootItemMain">
+                      <span className="graphRootItemTitle">{root.title}</span>
+                      <span className="graphRootItemMeta">
+                        {formatTime(root.createdAt)} · {ROOT_STATUS_LABELS[root.status]} · {root.nodeCount} 个节点
+                      </span>
+                    </span>
+                    {root.id === latestRootId ? <span className="graphRootItemTag">最新</span> : null}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       ) : null}
       {activeTab === "tree" ? (
         <div className="graphCanvasWrap">
           {graph ? (
-            <ReactFlowProvider>
-              <GraphCanvas graph={graph} selectedRootId={selectedRootId} onLocateMessage={props.onLocateMessage} />
-            </ReactFlowProvider>
+            <>
+              {rootVisibility ? (
+                <div className="graphNodeCountLine">
+                  当前根：共 {rootVisibility.total} 个节点 · 显示 {rootVisibility.visible} 个 · 已折叠 {rootVisibility.hidden} 个
+                </div>
+              ) : null}
+              <div className="graphCanvasFlow">
+                <ReactFlowProvider>
+                  <GraphCanvas graph={graph} selectedRootId={selectedRootId} onLocateMessage={props.onLocateMessage} onVisibilityChange={handleVisibilityChange} />
+                </ReactFlowProvider>
+              </div>
+            </>
           ) : error ? (
             <div className="graphEmpty">{error}</div>
           ) : (

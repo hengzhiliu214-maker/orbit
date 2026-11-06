@@ -7178,44 +7178,188 @@ button:active:not(:disabled) {
   color: var(--text-primary);
 }
 
-.graphRootBar {
+.graphPanelMeta {
   display: flex;
-  gap: 6px;
-  padding: 10px 12px;
-  overflow-x: auto;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  padding: 8px 16px;
   border-bottom: 1px solid var(--border-light);
-  scrollbar-width: thin;
+  font-size: 12px;
+  color: var(--text-muted);
 }
 
-.graphRootChip {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  max-width: 180px;
+.graphRefreshing {
+  color: var(--accent);
+}
+
+.graphRefreshBtn {
+  margin-left: auto;
   border: 1px solid var(--border);
   background: var(--bg-muted);
   color: var(--text-secondary);
   border-radius: 999px;
-  padding: 4px 10px;
+  padding: 3px 12px;
   font-size: 12px;
   cursor: pointer;
-  white-space: nowrap;
+}
+
+.graphRefreshBtn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.graphRefreshError {
+  padding: 6px 16px;
+  font-size: 12px;
+  color: var(--warning);
+  border-bottom: 1px solid var(--border-light);
+}
+
+.graphRootNotice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 16px;
+  font-size: 12.5px;
+  color: var(--text-primary);
+  background: var(--accent-subtle);
+  border-bottom: 1px solid var(--border-light);
+}
+
+.graphRootNotice button {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+
+.graphRootNotice button:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.graphRootHistory {
+  border-bottom: 1px solid var(--border-light);
+  max-height: 248px;
+  display: flex;
+  flex-direction: column;
   flex: none;
 }
 
-.graphRootChip.active {
+.graphRootHistoryHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 16px 6px;
+  font-size: 13px;
+  color: var(--text-primary);
+  flex: none;
+}
+
+.graphFollowToggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  font-weight: normal;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.graphRootList {
+  list-style: none;
+  margin: 0;
+  padding: 0 8px 8px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+.graphRootItem {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: 8px;
+  padding: 7px 10px;
+  font-size: 12.5px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.graphRootItem:hover {
+  background: var(--bg-hover);
+}
+
+.graphRootItem.active {
   background: var(--accent-subtle);
   border-color: var(--accent-border);
   color: var(--accent);
-  font-weight: 600;
 }
 
-.graphRootChipTitle {
+.graphRootItemMain {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1;
+}
+
+.graphRootItemTitle {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.graphRootItem.active .graphRootItemTitle {
+  color: var(--accent);
+}
+
+.graphRootItemMeta {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
+.graphRootItemTag {
+  flex: none;
+  font-size: 11px;
+  color: var(--accent);
+  border: 1px solid var(--accent-border);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+
+.graphNodeCountLine {
+  padding: 6px 16px;
+  font-size: 12px;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border-light);
+  flex: none;
+}
+
 .graphCanvasWrap {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.graphCanvasFlow {
   flex: 1;
   min-height: 0;
   position: relative;

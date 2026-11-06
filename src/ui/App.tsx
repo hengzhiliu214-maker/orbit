@@ -1,5 +1,6 @@
 import { CSSProperties, FormEvent, KeyboardEvent, MouseEvent, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { renderMarkdown, LOCAL_PATH_LINK_CLASS } from "./markdown-renderer.ts";
+import { buildGraphLiveSignature, hashAgentLabels } from "./graph-live-signature.ts";
 import { clampPreviewWidth, PREVIEW_DEFAULT_WIDTH } from "./file-preview.ts";
 import { isSafeExternalUrl } from "./url-guard.ts";
 import { AGENT_RUNTIME_PRIORITY, runtimeKindToCliKey, runtimeMeta } from "../core/runtime-meta.ts";
@@ -538,15 +539,17 @@ export function App() {
   }, [state.agents, supervisorConfig.runtime]);
   const messagesById = useMemo(() => new Map(state.messages.map((message) => [message.id, message])), [state.messages]);
   const visibleMessages = useMemo(() => state.messages.filter((message) => !message.discarded), [state.messages]);
-  // 指令链面板的实时签名：消息集合或任一消息的运行状态变化即触发面板防抖重拉。
-  const graphLiveSignature = useMemo(() => {
-    let hash = state.messages.length;
-    for (const message of state.messages) {
-      const token = `${message.id}:${message.runStatus ?? ""}:${message.status ?? ""}:${message.completedAt ?? ""};`;
-      for (let i = 0; i < token.length; i++) hash = (hash * 31 + token.charCodeAt(i)) | 0;
-    }
-    return `${state.conversation.id}:${hash}`;
-  }, [state.messages, state.conversation.id]);
+  // 指令链面板的实时签名（P2a/P2b，图结构/内容签名，见
+  // graph-live-signature.ts）：正文长度+散列、parentMessageId、
+  // routeDepth/routeState、sessionId、discarded、plan 当前步、员工名/
+  // runtime 映射散列。只按真正图输入变化重算：useMemo 依赖只挂
+  // state.messages / conversationId / 员工映射散列，不挂 content/cursor
+  // 草稿状态；逐消息 token 另有对象身份缓存，打字不触发重算。
+  const agentLabelsHash = useMemo(() => hashAgentLabels(agentsById), [agentsById]);
+  const graphLiveSignature = useMemo(
+    () => buildGraphLiveSignature(state.messages, state.conversation.id, agentLabelsHash),
+    [state.messages, state.conversation.id, agentLabelsHash],
+  );
   // GraphPanel 回调 props 引用稳定（P1 第一步 memo 隔离）：定位消息走
   // ref 转发最新实现，避免内联箭头函数让面板随每次输入重渲染。
   const revealMessageRef = useRef(revealMessage);
