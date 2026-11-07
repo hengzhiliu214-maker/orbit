@@ -5084,6 +5084,37 @@ button:active:not(:disabled) {
   background: var(--accent-subtle);
 }
 
+.deleteConfirmPanel {
+  width: min(480px, 90vw);
+}
+
+.deleteConfirmBody p {
+  margin: 0;
+  line-height: 1.6;
+}
+
+.deleteConfirmPath {
+  word-break: break-all;
+  font-size: 12px;
+}
+
+.modalFooter button.dangerButton {
+  background: #b42318;
+  border-color: #b42318;
+  color: #fff;
+}
+
+.modalFooter button.dangerButton:hover {
+  background: #912018;
+  border-color: #912018;
+  color: #fff;
+}
+
+.modalFooter button.dangerButton:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
 .settingsError {
   color: var(--error);
   font-size: 13px;

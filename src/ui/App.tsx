@@ -14,6 +14,7 @@ import { canSendMessage } from "../shared/message-validation.ts";
 import { createAttachmentUploadLifecycle } from "./attachment-upload-state.ts";
 import { createDefaultAgentChangeTracker, type DefaultAgentChangeRequest } from "./default-agent-change-state.ts";
 import { createConversationForUpload } from "./attachment-upload-conversation.ts";
+import { translateDeleteFailure, parseDeleteErrorMessage } from "./delete-flow.ts";
 import { appendTransientProcessActivity, collapseToolExecutions, type ProcessToolActivity, type ProcessToolExecution } from "../shared/process-activity.ts";
 import { WorkAnalysisPanel } from "./WorkAnalysisPanel.tsx";
 import { GraphPanel } from "./GraphPanel.tsx";
@@ -219,6 +220,9 @@ export function App() {
   const [editingConversationName, setEditingConversationName] = useState("");
   const [openWorkspaceMenuId, setOpenWorkspaceMenuId] = useState<string | null>(null);
   const [openConversationMenuId, setOpenConversationMenuId] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<{ kind: "workspace"; workspace: Workspace } | { kind: "conversation"; conversation: Conversation } | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
   const [expandedWorkspaceIds, setExpandedWorkspaceIds] = useState<Set<string>>(() => new Set());  // non-active workspaces only; active workspace is always expanded
   const [isPickingDirectory, setIsPickingDirectory] = useState(false);
   const [pendingWorkspacePath, setPendingWorkspacePath] = useState<string | null>(null);
@@ -1690,10 +1694,45 @@ export function App() {
     refreshState();
   }
 
-  async function deleteWorkspace(workspace: Workspace) {
-    if (!confirm(`Delete workspace "${workspace.name}"?`)) return;
-    const response = await fetch(`/api/workspaces/${workspace.id}`, { method: "DELETE" });
-    if (!response.ok) return;
+  function requestDeleteWorkspace(workspace: Workspace) {
+    setOpenWorkspaceMenuId(null);
+    setDeleteError(null);
+    setDeleteTarget({ kind: "workspace", workspace });
+  }
+
+  function requestDeleteConversation(conversation: Conversation) {
+    setOpenConversationMenuId(null);
+    setDeleteError(null);
+    setDeleteTarget({ kind: "conversation", conversation });
+  }
+
+  async function confirmDeleteTarget() {
+    if (!deleteTarget || isDeleting) return;
+    setIsDeleting(true);
+    setDeleteError(null);
+    try {
+      const ok = deleteTarget.kind === "workspace"
+        ? await deleteWorkspace(deleteTarget.workspace)
+        : await deleteConversation(deleteTarget.conversation);
+      if (ok) setDeleteTarget(null);
+    } finally {
+      setIsDeleting(false);
+    }
+  }
+
+  async function deleteWorkspace(workspace: Workspace): Promise<boolean> {
+    let response: Response;
+    try {
+      response = await fetch(`/api/workspaces/${workspace.id}`, { method: "DELETE" });
+    } catch {
+      setDeleteError("删除失败：网络连接出错，请稍后再试。");
+      return false;
+    }
+    if (!response.ok) {
+      const body = await response.json().catch(() => null);
+      setDeleteError(translateDeleteFailure(response.status, parseDeleteErrorMessage(body), "workspace"));
+      return false;
+    }
     setOpenWorkspaceMenuId(null);
     setExpandedWorkspaceIds((ids) => {
       const next = new Set(ids);
@@ -1704,7 +1743,7 @@ export function App() {
     refreshWorkspaces();
     if (!isCurrentPage) {
       refreshConversations();
-      return;
+      return true;
     }
 
     // The deleted page context is no longer valid. Let the server choose the
@@ -1712,13 +1751,14 @@ export function App() {
     window.history.pushState(null, "", `${window.location.pathname}${window.location.hash}`);
     const requestVersion = ++stateRequestVersionRef.current;
     const nextStateResponse = await fetch("/api/state");
-    if (!nextStateResponse.ok || requestVersion !== stateRequestVersionRef.current) return;
+    if (!nextStateResponse.ok || requestVersion !== stateRequestVersionRef.current) return true;
     const nextState = normalizeState(await nextStateResponse.json() as AppState);
     if (nextState.workspace.id) {
       window.history.replaceState(null, "", `${window.location.pathname}${pageContextQuery({ workspaceId: nextState.workspace.id, conversationId: nextState.conversation.id })}${window.location.hash}`);
     }
     setState(nextState);
     refreshConversations();
+    return true;
   }
 
   async function switchConversation(conversationId: string, targetWorkspaceId?: string) {
@@ -1789,9 +1829,19 @@ export function App() {
     if ((workspaceId || state.workspace.id) === state.workspace.id && conversationId === state.conversation.id) refreshState();
   }
 
-  async function deleteConversation(conversation: Conversation) {
-    if (!confirm(`Delete conversation "${conversation.name}"?`)) return;
-    const response = await fetch(`/api/conversations/${conversation.id}?workspaceId=${conversation.workspaceId}`, { method: "DELETE" });
+  async function deleteConversation(conversation: Conversation): Promise<boolean> {
+    let response: Response;
+    try {
+      response = await fetch(`/api/conversations/${conversation.id}?workspaceId=${conversation.workspaceId}`, { method: "DELETE" });
+    } catch {
+      setDeleteError("删除失败：网络连接出错，请稍后再试。");
+      return false;
+    }
+    if (!response.ok) {
+      const body = await response.json().catch(() => null);
+      setDeleteError(translateDeleteFailure(response.status, parseDeleteErrorMessage(body), "conversation"));
+      return false;
+    }
     if (response.ok) {
       setOpenConversationMenuId(null);
       refreshConversations();
@@ -1814,6 +1864,7 @@ export function App() {
         }
       }
     }
+    return true;
   }
 
   function updateCursorFromInput() {
@@ -2046,7 +2097,7 @@ export function App() {
                             >
                               重命名工作区
                             </button>
-                            <button type="button" onClick={() => deleteWorkspace(ws)}>删除工作区</button>
+                            <button type="button" onClick={() => requestDeleteWorkspace(ws)}>删除工作区</button>
                           </div>
                         ) : null}
                       </div>
@@ -2117,7 +2168,7 @@ export function App() {
                                   >
                                     重命名会话
                                   </button>
-                                  <button type="button" onClick={() => deleteConversation(conv)}>删除会话</button>
+                                  <button type="button" onClick={() => requestDeleteConversation(conv)}>删除会话</button>
                                 </div>
                               ) : null}
                             </div>
@@ -2685,6 +2736,37 @@ export function App() {
           onClose={() => setShowSupervisorSettings(false)}
           onSave={saveSupervisorConfig}
         />
+      ) : null}
+      {deleteTarget ? (
+        <div className="modalOverlay" onClick={() => { if (!isDeleting) { setDeleteTarget(null); setDeleteError(null); } }}>
+          <div className="modalPanel deleteConfirmPanel" role="alertdialog" aria-modal="true" aria-label={deleteTarget.kind === "workspace" ? "删除工作区" : "删除会话"} onClick={(e) => e.stopPropagation()}>
+            <div className="modalHeader">
+              <h2>{deleteTarget.kind === "workspace" ? "删除工作区" : "删除会话"}</h2>
+              <button type="button" onClick={() => { setDeleteTarget(null); setDeleteError(null); }} disabled={isDeleting}>&times;</button>
+            </div>
+            <div className="settingsBody deleteConfirmBody">
+              {deleteTarget.kind === "workspace" ? (
+                <>
+                  <p>确定要删除工作区「{deleteTarget.workspace.name}」吗？</p>
+                  <p>删除会清掉 Orbit 里这个工作区的登记，以及它在 Orbit 里的会话和记录数据（保存在 ~/.orbit 内）。</p>
+                  <p><strong>不会删除电脑上的实际项目文件夹和文件</strong>，项目文件会原样保留。</p>
+                  {deleteTarget.workspace.path ? <p className="deleteConfirmPath">{deleteTarget.workspace.path}</p> : null}
+                </>
+              ) : (
+                <>
+                  <p>确定要删除会话「{deleteTarget.conversation.name}」吗？</p>
+                  <p>删除会清掉 Orbit 里这个会话的记录数据（保存在 ~/.orbit 内）。</p>
+                  <p><strong>不会删除电脑上的实际项目文件夹和文件</strong>，项目文件会原样保留。</p>
+                </>
+              )}
+              {deleteError ? <p className="settingsError" role="alert">{deleteError}</p> : null}
+            </div>
+            <div className="modalFooter">
+              <button type="button" onClick={() => { setDeleteTarget(null); setDeleteError(null); }} disabled={isDeleting}>取消</button>
+              <button type="button" className="dangerButton" onClick={() => { void confirmDeleteTarget(); }} disabled={isDeleting}>{isDeleting ? "正在删除…" : "确认删除"}</button>
+            </div>
+          </div>
+        </div>
       ) : null}
       {previewAttachment ? (
         <div className="imagePreviewOverlay" onClick={() => setPreviewAttachment(null)}>
